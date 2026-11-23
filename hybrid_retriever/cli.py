@@ -108,6 +108,12 @@ def cmd_eval(args) -> None:
         )
         print_vbd_report(result)
         return
+    if args.tobench:
+        from .tobench import print_tobench_report, run_tobench_eval
+
+        result = run_tobench_eval(n_tasks=args.tasks)
+        print_tobench_report(result)
+        return
     if args.trace:
         result = run_synthetic_trace(
             os.path.join("eval_data", "synthetic_corpus.jsonl"),
@@ -423,6 +429,13 @@ def main() -> None:
         help="P20 verify-by-doing eval: causal lift of rule memories "
         "on computed-answer tasks (no-memory vs bm25 / vector / "
         "hybrid / oracle, plus leave-one-out adoption gate)",
+    )
+    pe.add_argument(
+        "--tobench",
+        action="store_true",
+        help="P21 mini-TOBench eval: two deterministic agent policies "
+        "on 12 tool-use tasks over the memory/files/tracker servers "
+        "(no embedder needed)",
     )
     pe.add_argument(
         "--k", type=int, default=5,

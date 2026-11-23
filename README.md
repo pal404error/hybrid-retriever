@@ -766,3 +766,109 @@ one in every retrieval metric.
   lose importance, and one whose lift is positive and outside
   noise should gain it — the VbD loop is what makes TRACE
   credit causal instead of correlational.
+
+## P21 — Mini-TOBench: verifier-first evals for a workspace-assistant domain
+
+TOBench (arXiv:2605.16909) scores agents on executable tasks over
+real tool surfaces, with programmatic verifiers that inspect
+artifacts and tool-call traces instead of judging final text. This
+module (`hybrid_retriever/tobench.py`) is the small deterministic
+version of that idea, built to be the harness P20's VbD loop and
+P23's self-improving loop plug into.
+
+Three servers, one domain (a workspace assistant over the hybrid
+store), all real tool surfaces the agents only touch through
+`call_tool`:
+
+- `memory` — recall / remember (with supersedes) / forget / list,
+  backed by the real `Store` (SQLite) from P1.
+- `files` — read / write / append / list, backed by a real
+  directory; paths cannot escape the workspace root.
+- `tracker` — create / complete / add-note / list, backed by a
+  real `tasks.json` in the workspace.
+
+Each server also has a thin stdio JSON-RPC 2.0 wrapper
+(`python -m hybrid_retriever.tobench serve --server files --root DIR`,
+methods `call_tool` / `list_tools`), so they can be driven over a
+pipe like a real MCP server.
+
+12 tasks, 4 kinds x 3 variants, each with a grounded verifier that
+checks the artifact (recomputed from the environment, not trusted
+from the agent), the tool-call trace (ordering, required calls,
+forbidden tools, call budget), and the store state. Each failed
+check carries a detail string — expected vs got, which call was
+missing, which order was violated — so a failure is diagnosable
+from the verifier output alone. Reproduce with
+`hr eval --tobench` (no embedder needed).
+
+Substitutions, stated plainly: there is no LLM on this VM and no
+model API key exists, so the "two models" are two DETERMINISTIC
+agent policies, not models — `grounded` (recall first, read
+sources, compute from the real artifacts with dedup, tracker work
+in the right order) and `sloppy` (no recall, naive compute without
+dedup, tracker tasks completed before the deliverable exists,
+corrections stored without superseding). No model names or scores
+are invented. The servers run in-process, so there is no
+transport, auth, or concurrency to test. Memory recall is BM25
+only (no embedder); the vector leg is exercised by the P1/P20
+evals. Tasks are a fixed 12-task set (seed 7), not a sample from
+a task distribution.
+
+### Measured results — mini-TOBench (synthetic, labelled)
+
+| agent | total | summarize | correct | compute | deliver |
+|---|---|---|---|---|---|
+| grounded | 12/12 (1.000) | 3/3 | 3/3 | 3/3 | 3/3 |
+| sloppy | 1/12 (0.083) | 1/3 | 0/3 | 0/3 | 0/3 |
+
+Sloppy's single pass is S3, the one prompt-contained task (the
+facts are in the task text, no recall needed). Every other sloppy
+failure names its cause: S1/S2 write the distractor ("tea",
+"March 3") instead of the recalled facts and never call recall;
+C1–C3 leave the wrong record live (`old record #1 status=live,
+superseded_by=None`); M1 writes 375.25 where the deduped total
+is 254.75, M2 writes 46.00 vs 41.50, M3 counts 5 rows where
+3 are distinct; D1–D3 complete the tracker task at trace 0,
+before the deliverable write at trace 1, and never call recall.
+
+The honest reading: the harness discriminates — 12/12 vs 1/12
+with a per-task table and a named cause per failure — but the
+scores say nothing about any LLM. Both policies were written
+with knowledge of the task structure, so `grounded` passing
+everything is the harness working as designed, not evidence
+that a model would. What the scores do prove is narrower and
+is the point of the build: a task's failure is diagnosable from
+the verifier output alone (the M1 detail alone — "expected
+254.75 (deduped from expenses.json), got 375.25" — tells you
+the agent summed without dedup), and the interesting failures
+are wrong tool use, not wrong text. The ceiling here is the
+policy, not the model: drop a real model policy into `AGENTS`
+and the same tasks and verifiers score it unchanged. The
+reference frame is the full TOBench: best model 41.0%, human
+94.0% — this 12-task set is far easier by construction, so
+do not compare the 1.000 to either number.
+
+### Regressions (re-run after P21)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 29,514 tokens saved, faithfulness
+  0.486, 0 violations).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+
+## What P21 hooks into (P22/P23)
+
+- P23's GEPA-style loop A/B-tests prompt/skill edits on this
+  fixed task set: the per-task table is the metric, and an edit
+  is kept only if it wins on it.
+- P20's adoption gate gains a second consumer: a rule memory
+  whose lift the VbD harness measured can be scored here too,
+  as the policy the agent follows when the memory is recalled.
