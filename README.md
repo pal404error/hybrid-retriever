@@ -111,9 +111,45 @@ reasons, both fixable in later plans, not by tuning constants here:
    `weight_sweep.py` exists to re-tune per corpus, and per-query
    weight adaptation is a P2 follow-up.
 
-### LongMemEval-S (real, 50 questions)
+### LongMemEval-S (real, 50 of 500 questions, 2,375 sessions)
 
-<!-- filled in after the run; see eval_data/longmemeval_s_50_results.txt -->
+Dataset: `xiaowu0162/longmemeval-cleaned`,
+`longmemeval_s_cleaned.json` (SHA-256 verified
+`d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442`).
+Abstention questions excluded, as in the official harness. Records
+are whole sessions; each question is scored against its own ~50
+session haystack via `candidate_ids`. Run took ~9 min on this VM.
+
+| mode | P@10 | R@10 | nDCG@10 | any-hit@5 | grounding@10 |
+|---|---|---|---|---|---|
+| bm25 | 0.100 | 1.000 | 0.961 | 1.000 | 1.000 |
+| vector | 0.154 | 0.860 | 0.715 | 0.800 | 0.860 |
+| hybrid (paper weights) | 0.098 | 0.980 | 0.908 | 0.920 | 0.980 |
+| hybrid+mmr | 0.086 | 0.860 | 0.699 | 0.820 | 0.860 |
+| hybrid+rerank | 0.092 | 0.920 | 0.738 | 0.760 | 0.920 |
+
+**Honest reading — the opposite of the synthetic result, same lesson:**
+BM25 alone is the strongest leg here, and that matches published
+work (an independent BM25 implementation reports 95% R@5 on this
+benchmark). LongMemEval questions share distinctive keywords with
+the gold session, so lexical matching wins; the vector leg loses
+because whole sessions are truncated to 256 tokens and the answer
+detail often sits past the cut. The fixed-weight hybrid dilutes the
+strong leg with the weak one (R@10 0.980 vs BM25's 1.000), MMR hurts
+because the gold session resembles its neighbours, and the
+cross-encoder rerank hurts (any-hit@5 0.760 vs 0.920) because it
+also only sees the first 512 tokens of each session.
+
+So: the fusion machinery works, but on this benchmark the *inputs*
+to the vector and rerank legs are wrong — they need chunked or
+summarised sessions, not truncated wholes. That is the concrete
+next step for the larp v1.4 integration (chunk records before
+embedding; rerank on the chunk, not the session), and it is why the
+synthetic corpus — where records are short — shows the opposite
+ranking. Both results are real; they disagree because the corpora
+differ, and the README says so instead of picking the flattering
+one. The full 500-question run is the obvious follow-up once a
+faster machine is available.
 
 ## Tests
 
