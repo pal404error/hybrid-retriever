@@ -171,6 +171,39 @@ class Store:
                  kind TEXT NOT NULL DEFAULT 'related',
                  PRIMARY KEY (src, dst, kind))"""
         )
+        # P18 (CWL structured context eviction): episodes are the
+        # context — typed, dependency-linked units of one session's
+        # trajectory, each linked to its turn record. Records are the
+        # memory; eviction removes from context, never deletes memory.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS episodes(
+                 id INTEGER PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 seq INTEGER NOT NULL,
+                 record_id INTEGER NOT NULL,
+                 type TEXT NOT NULL,
+                 tokens INTEGER NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'live',
+                 persisted_by INTEGER,
+                 depends_on TEXT NOT NULL DEFAULT '[]',
+                 created_at REAL NOT NULL)"""
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS episodes_session "
+            "ON episodes(session_id, seq)"
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS evictions(
+                 id INTEGER PRIMARY KEY,
+                 episode_id INTEGER NOT NULL,
+                 session_id TEXT NOT NULL,
+                 reason TEXT NOT NULL,
+                 tier INTEGER NOT NULL,
+                 tokens_freed INTEGER NOT NULL,
+                 budget_tokens INTEGER NOT NULL,
+                 total_tokens_before INTEGER NOT NULL,
+                 created_at REAL NOT NULL)"""
+        )
         if self.vec_mode == "numpy":
             c.execute(
                 """CREATE TABLE IF NOT EXISTS embeddings(
@@ -452,6 +485,194 @@ class Store:
             "UPDATE merges SET status = ? WHERE id = ?", (status, merge_id)
         )
         self.conn.commit()
+
+    # -- P18: episodes (context) and evictions (audit) ----------------
+    def add_episode(
+        self,
+        session_id: str,
+        record_id: int,
+        type_: str,
+        tokens: int,
+        depends_on: list[int] | None = None,
+        persisted_by: int | None = None,
+    ) -> int:
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(seq), -1) FROM episodes WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        seq = int(row[0]) + 1
+        cur = self.conn.execute(
+            "INSERT INTO episodes(session_id, seq, record_id, type, "
+            "tokens, status, persisted_by, depends_on, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?)",
+            (
+                session_id,
+                seq,
+                record_id,
+                type_,
+                tokens,
+                persisted_by,
+                json.dumps(depends_on or []),
+                time.time(),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def _row_to_episode(self, row) -> dict:
+        return {
+            "id": row[0],
+            "session_id": row[1],
+            "seq": row[2],
+            "record_id": row[3],
+            "type": row[4],
+            "tokens": row[5],
+            "status": row[6],
+            "persisted_by": row[7],
+            "depends_on": json.loads(row[8]),
+            "created_at": row[9],
+        }
+
+    def get_episode(self, episode_id: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT id, session_id, seq, record_id, type, tokens, "
+            "status, persisted_by, depends_on, created_at FROM episodes "
+            "WHERE id = ?",
+            (episode_id,),
+        ).fetchone()
+        return self._row_to_episode(row) if row is not None else None
+
+    def list_episodes(
+        self, session_id: str, status: str | None = None
+    ) -> list[dict]:
+        sql = (
+            "SELECT id, session_id, seq, record_id, type, tokens, "
+            "status, persisted_by, depends_on, created_at FROM episodes "
+            "WHERE session_id = ?"
+        )
+        params: list = [session_id]
+        if status is not None:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY seq"
+        rows = self.conn.execute(sql, params).fetchall()
+        return [self._row_to_episode(r) for r in rows]
+
+    def session_token_total(self, session_id: str) -> int:
+        """Tokens of the session's live episodes — its context size."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(tokens), 0) FROM episodes "
+            "WHERE session_id = ? AND status = 'live'",
+            (session_id,),
+        ).fetchone()
+        return int(row[0])
+
+    def set_episode_status(self, episode_id: int, status: str) -> None:
+        self.conn.execute(
+            "UPDATE episodes SET status = ? WHERE id = ?",
+            (status, episode_id),
+        )
+        self.conn.commit()
+
+    def set_episode_persisted(
+        self, episode_id: int, record_id: int
+    ) -> None:
+        self.conn.execute(
+            "UPDATE episodes SET persisted_by = ? WHERE id = ?",
+            (record_id, episode_id),
+        )
+        self.conn.commit()
+
+    def episodes_depending_on(
+        self, episode_id: int, session_id: str | None = None
+    ) -> list[dict]:
+        """Live episodes whose depends_on lists this episode."""
+        eps = self.list_episodes(session_id, status="live") if (
+            session_id is not None
+        ) else [
+            self._row_to_episode(r)
+            for r in self.conn.execute(
+                "SELECT id, session_id, seq, record_id, type, tokens, "
+                "status, persisted_by, depends_on, created_at "
+                "FROM episodes WHERE status = 'live' ORDER BY seq"
+            ).fetchall()
+        ]
+        return [e for e in eps if episode_id in e["depends_on"]]
+
+    def add_eviction(
+        self,
+        episode_id: int,
+        session_id: str,
+        reason: str,
+        tier: int,
+        tokens_freed: int,
+        budget_tokens: int,
+        total_tokens_before: int,
+    ) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO evictions(episode_id, session_id, reason, "
+            "tier, tokens_freed, budget_tokens, total_tokens_before, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                episode_id,
+                session_id,
+                reason,
+                tier,
+                tokens_freed,
+                budget_tokens,
+                total_tokens_before,
+                time.time(),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def list_evictions(
+        self, session_id: str | None = None
+    ) -> list[dict]:
+        sql = (
+            "SELECT id, episode_id, session_id, reason, tier, "
+            "tokens_freed, budget_tokens, total_tokens_before, "
+            "created_at FROM evictions"
+        )
+        params: list = []
+        if session_id is not None:
+            sql += " WHERE session_id = ?"
+            params.append(session_id)
+        sql += " ORDER BY id"
+        rows = self.conn.execute(sql, params).fetchall()
+        return [
+            {
+                "id": r[0],
+                "episode_id": r[1],
+                "session_id": r[2],
+                "reason": r[3],
+                "tier": r[4],
+                "tokens_freed": r[5],
+                "budget_tokens": r[6],
+                "total_tokens_before": r[7],
+                "created_at": r[8],
+            }
+            for r in rows
+        ]
+
+    def context_record_ids(self, session_id: str) -> list[int]:
+        """Record ids the agent can use right now: live episodes'
+        records (the context) plus live non-episode records (the
+        consolidated memory). Evicted episodes' records are out.
+        """
+        live_ep = self.conn.execute(
+            "SELECT record_id FROM episodes WHERE session_id = ? "
+            "AND status = 'live'",
+            (session_id,),
+        ).fetchall()
+        ids = {int(r[0]) for r in live_ep}
+        mem = self.conn.execute(
+            "SELECT id FROM records WHERE status = 'live' "
+            "AND type != 'episode'"
+        ).fetchall()
+        ids |= {int(r[0]) for r in mem}
+        return sorted(ids)
 
     # -- reads ---------------------------------------------------------
     def doc_freq(self, term: str) -> int:

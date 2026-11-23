@@ -718,3 +718,371 @@ def print_segment_report(result: dict) -> None:
                 result["planner"]["routes"].get(qkind, {}),
             )
         )
+
+
+# ----------------------------------------------------------------------
+# P18 — CWL eviction demo: one long session vs isolated sessions
+# ----------------------------------------------------------------------
+def _eviction_task_turns(question: str, gold_texts: list[str]) -> list[dict]:
+    """One task as 7 annotated turns.
+
+    user (the question) -> reasoning -> tool_call -> 3 x tool_result
+    (the gold facts) -> chatter (ack). The user turn is the
+    conversation, not a fact: it is deliberately excluded from the
+    per-task consolidation below, so it survives as a live episode
+    record and the user-turn-recall metric can see it.
+    """
+    turns = [
+        {"role": "user", "text": question},
+        {
+            "role": "assistant",
+            "text": "Let me look up the records for this question.",
+        },
+        {
+            "role": "assistant",
+            "text": "lookup records",
+            "episode_type": "tool_call",
+        },
+    ]
+    turns.extend({"role": "tool", "text": t} for t in gold_texts)
+    turns.append(
+        {"role": "assistant", "text": "Noted.", "episode_type": "chatter"}
+    )
+    return turns
+
+
+def run_eviction_eval(
+    corpus_path: str,
+    queries_path: str,
+    embedder=None,
+    n_tasks: int = 40,
+    budget_frac: float = 1.0 / 3.0,
+    verbose: bool = True,
+) -> dict:
+    """P18 eval: a long session under a token budget, three arms.
+
+    Tasks are synthetic queries (first n_tasks//2 keyword + first
+    n_tasks//2 paraphrase, file order — deterministic). Each task
+    is 7 turns; after each task the session consolidates the
+    task's non-user turns into one segment record (P3 machinery
+    via ``propose_merge``), marks the absorbed episodes persisted,
+    and evicts to budget. Arms: ``isolated`` (each task alone, no
+    budget, no eviction), ``cwl`` (tiered policy), ``naive``
+    (oldest-first truncation, same active window).
+
+    Two accuracies, both any-hit@5:
+    - task questions, scored over context + memory (live episode
+      records + live segment records). Consolidation preserves
+      facts, so both long arms are expected near isolated here —
+      that is a finding, not a failure.
+    - user-turn recall, scored over live episode records only:
+      can the agent still find what the user asked? CWL never
+      evicts user turns; naive truncation does. This is where the
+      policy shows.
+    """
+    from .eviction import (
+        dependency_violations,
+        estimate_tokens,
+        evict_to_budget,
+        ingest_session,
+        mark_session_persisted_by_merges,
+    )
+    from .lifecycle import draft_merge_text, propose_merge
+    from .segments import classify_segment
+
+    embedder = embedder or get_embedder()
+    records, queries = load_synthetic(corpus_path, queries_path)
+    by_key = {r["key"]: r for r in records}
+    # Candidate pool in file order (keyword first, then
+    # paraphrase); keep the first n_tasks with a distinct gold
+    # attribute, so each task's gold set is unambiguous.
+    tasks = []
+    seen_gold: set[tuple[str, ...]] = set()
+    pool = [q for q in queries if q["kind"] == "keyword"] + [
+        q for q in queries if q["kind"] == "paraphrase"
+    ]
+    for q in pool:
+        key = tuple(sorted(q["gold_keys"]))
+        if key in seen_gold:
+            continue
+        seen_gold.add(key)
+        tasks.append(q)
+        if len(tasks) >= n_tasks:
+            break
+    for q in tasks:
+        q["_gold_texts"] = [
+            by_key[k]["text"] for k in q["gold_keys"] if k in by_key
+        ]
+    # Budget from the full session's tokens, before running it.
+    total_tokens = sum(
+        estimate_tokens(t["text"])
+        for q in tasks
+        for t in _eviction_task_turns(q["question"], q["_gold_texts"])
+    )
+    budget = max(1, int(total_tokens * budget_frac))
+    if verbose:
+        print(
+            "eviction eval: %d tasks, %d turns, %d tokens total, "
+            "budget %d (%.0f%%)"
+            % (
+                len(tasks),
+                len(tasks) * 7,
+                total_tokens,
+                budget,
+                budget_frac * 100,
+            )
+        )
+
+    def _consolidate_task(store, episode_ids):
+        """Merge a finished task's non-user turns into one segment.
+
+        User turns are excluded: they are the conversation, not
+        facts to merge. Returns the merged record id or None.
+        """
+        eps = [store.get_episode(e) for e in episode_ids]
+        srcs = [
+            e for e in eps if e is not None and e["type"] != "user"
+        ]
+        if len(srcs) < 2:
+            return None
+        ids = [e["record_id"] for e in srcs]
+        texts = [store.get_record(i)["text"] for i in ids]
+        union = draft_merge_text(texts)
+        res = propose_merge(
+            store,
+            embedder,
+            ids,
+            merged_text=union,
+            type_override=classify_segment(union),
+            max_length_ratio=1.0,
+        )
+        return res.merged_record_id
+
+    def _score(store, question, gold, candidates):
+        if not candidates:
+            return 0.0
+        ranked = [
+            r.id
+            for r in retrieve(
+                store, embedder, question, k=10, use_mmr=False,
+                candidate_ids=candidates,
+            )
+        ]
+        return any_hit_at_k(ranked, gold, 5)
+
+    def _run_long(policy: str):
+        tmp = tempfile.mkdtemp(prefix="hr-evict-")
+        store = Store(os.path.join(tmp, "eval.db"), embedder=embedder)
+        session = "long-%s" % policy
+        ev_summaries = []
+        # Per-task gold, tracked by record id at ingest time —
+        # never by text matching: stored turn text carries a
+        # "role: " prefix the corpus gold texts do not have.
+        task_gold_rids: list[set[int]] = []
+        task_user_rids: list[int] = []
+        for q in tasks:
+            turns = _eviction_task_turns(q["question"], q["_gold_texts"])
+            ep_ids = ingest_session(store, session, turns)
+            gold: set[int] = set()
+            user_rid: int | None = None
+            for eid in ep_ids:
+                ep = store.get_episode(eid)
+                if ep["type"] == "tool_result":
+                    gold.add(ep["record_id"])
+                elif ep["type"] == "user":
+                    user_rid = ep["record_id"]
+            task_gold_rids.append(gold)
+            task_user_rids.append(user_rid)
+            _consolidate_task(store, ep_ids)
+            mark_session_persisted_by_merges(store, session)
+            ev_summaries.append(
+                evict_to_budget(
+                    store, session, budget, policy=policy
+                )
+            )
+        # Gold mapping through the merges table, as in the P3 eval:
+        # a consolidated turn's gold is the segment record that
+        # absorbed it; a rejected merge leaves the turn itself.
+        seg_of_turn: dict[int, int] = {}
+        for m in store.list_merges(status="committed"):
+            for src in m["merged_ids"]:
+                seg_of_turn[src] = m["merged_record_id"]
+        task_scores: list[float] = []
+        recall_scores: list[float] = []
+        live_ep_recs = [
+            e["record_id"]
+            for e in store.list_episodes(session, status="live")
+        ]
+        for q, gold_rids, user_rid in zip(
+            tasks, task_gold_rids, task_user_rids
+        ):
+            gold = {seg_of_turn.get(r, r) for r in gold_rids}
+            task_scores.append(
+                _score(
+                    store,
+                    q["question"],
+                    gold,
+                    store.context_record_ids(session),
+                )
+            )
+            if user_rid is not None:
+                recall_scores.append(
+                    _score(
+                        store,
+                        q["question"],
+                        {user_rid},
+                        live_ep_recs,
+                    )
+                )
+        live = store.list_episodes(session, status="live")
+        user_live = sum(1 for e in live if e["type"] == "user")
+        last = ev_summaries[-1] if ev_summaries else {}
+        by_tier: dict[int, int] = {}
+        for s in ev_summaries:
+            for t, n in s.get("evicted_by_tier", {}).items():
+                by_tier[t] = by_tier.get(t, 0) + n
+        result = {
+            "task_any_hit5": (
+                sum(task_scores) / len(task_scores) if task_scores else 0.0
+            ),
+            "user_turn_recall": (
+                sum(recall_scores) / len(recall_scores)
+                if recall_scores
+                else 0.0
+            ),
+            "user_turns_live": user_live,
+            "user_turns_total": len(tasks),
+            "live_tokens": store.session_token_total(session),
+            "total_tokens": total_tokens,
+            "budget": budget,
+            "evicted_total": sum(
+                s.get("n_evicted", 0) for s in ev_summaries
+            ),
+            "evicted_by_tier": by_tier,
+            "dependency_violations": len(
+                dependency_violations(store, session)
+            ),
+            "under_budget": bool(last.get("under_budget", True)),
+        }
+        store.close()
+        return result
+
+    def _run_isolated():
+        scores: list[float] = []
+        recall_scores: list[float] = []
+        for q in tasks:
+            tmp = tempfile.mkdtemp(prefix="hr-iso-")
+            store = Store(
+                os.path.join(tmp, "eval.db"), embedder=embedder
+            )
+            session = "isolated"
+            turns = _eviction_task_turns(q["question"], q["_gold_texts"])
+            ep_ids = ingest_session(store, session, turns)
+            gold = {
+                store.get_episode(e)["record_id"]
+                for e in ep_ids
+                if store.get_episode(e)["type"] == "tool_result"
+            }
+            all_recs = [
+                e["record_id"]
+                for e in store.list_episodes(session)
+            ]
+            scores.append(
+                _score(store, q["question"], gold, all_recs)
+            )
+            user_rec = next(
+                (
+                    store.get_episode(e)["record_id"]
+                    for e in ep_ids
+                    if store.get_episode(e)["type"] == "user"
+                ),
+                None,
+            )
+            if user_rec is not None:
+                recall_scores.append(
+                    _score(
+                        store, q["question"], {user_rec}, all_recs
+                    )
+                )
+            store.close()
+        return {
+            "task_any_hit5": (
+                sum(scores) / len(scores) if scores else 0.0
+            ),
+            "user_turn_recall": (
+                sum(recall_scores) / len(recall_scores)
+                if recall_scores
+                else 0.0
+            ),
+        }
+
+    arms = {
+        "isolated": _run_isolated(),
+        "cwl": _run_long("cwl"),
+        "naive": _run_long("naive"),
+    }
+    return {
+        "corpus": "synthetic tasks (labelled)",
+        "n_tasks": len(tasks),
+        "total_tokens": total_tokens,
+        "budget": budget,
+        "budget_frac": budget_frac,
+        "embedder": embedder.name,
+        "arms": arms,
+    }
+
+
+def print_eviction_report(result: dict) -> None:
+    print("\n== %s ==" % result["corpus"])
+    print(
+        "tasks: %d   total tokens: %d   budget: %d (%.0f%%)   "
+        "embedder: %s"
+        % (
+            result["n_tasks"],
+            result["total_tokens"],
+            result["budget"],
+            result["budget_frac"] * 100,
+            result["embedder"],
+        )
+    )
+    print(
+        "%-10s %12s %16s %14s %12s %10s"
+        % (
+            "arm",
+            "task hit@5",
+            "user-turn rec.",
+            "user turns",
+            "live toks",
+            "dep. viol.",
+        )
+    )
+    for arm, m in result["arms"].items():
+        user_turns = (
+            "%d/%d" % (m.get("user_turns_live", "-"), m.get("user_turns_total", "-"))
+            if "user_turns_live" in m
+            else "-"
+        )
+        live_toks = str(m.get("live_tokens", "-"))
+        viol = str(m.get("dependency_violations", "-"))
+        print(
+            "%-10s %12.3f %16.3f %14s %12s %10s"
+            % (
+                arm,
+                m["task_any_hit5"],
+                m["user_turn_recall"],
+                user_turns,
+                live_toks,
+                viol,
+            )
+        )
+    for arm in ("cwl", "naive"):
+        m = result["arms"][arm]
+        print(
+            "%s: evicted %d (by tier %s), under budget: %s"
+            % (
+                arm,
+                m.get("evicted_total", 0),
+                m.get("evicted_by_tier", {}),
+                m.get("under_budget", "-"),
+            )
+        )

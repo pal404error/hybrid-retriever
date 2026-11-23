@@ -8,12 +8,19 @@ import os
 
 from .embeddings import get_embedder
 from .eval import (
+    print_eviction_report,
     print_report,
     print_segment_report,
+    run_eviction_eval,
     run_longmemeval,
     run_segment_eval,
     run_synthetic,
     run_synthetic_trace,
+)
+from .eviction import (
+    evict_to_budget,
+    explain_episode,
+    ingest_session,
 )
 from .lifecycle import record_use, sleep
 from .rerank import get_reranker
@@ -68,6 +75,16 @@ def cmd_eval(args) -> None:
             window=args.window,
         )
         print_segment_report(result)
+        return
+    if args.eviction:
+        result = run_eviction_eval(
+            os.path.join("eval_data", "synthetic_corpus.jsonl"),
+            os.path.join("eval_data", "synthetic_queries.json"),
+            embedder=embedder,
+            n_tasks=args.tasks,
+            budget_frac=args.budget_frac,
+        )
+        print_eviction_report(result)
         return
     if args.trace:
         result = run_synthetic_trace(
@@ -208,6 +225,88 @@ def cmd_plan(args) -> None:
     store.close()
 
 
+def cmd_ingest(args) -> None:
+    """Ingest an annotated transcript (JSONL turns) as episodes."""
+    store = Store(args.db, embedder=get_embedder())
+    with open(args.transcript, encoding="utf-8") as f:
+        turns = [json.loads(line) for line in f if line.strip()]
+    ids = ingest_session(store, args.session, turns)
+    print(
+        "ingested %d turns into session %r "
+        "(context tokens: %d)"
+        % (
+            len(ids),
+            args.session,
+            store.session_token_total(args.session),
+        )
+    )
+    store.close()
+
+
+def cmd_evict(args) -> None:
+    """Evict a session's episodes to a token budget."""
+    store = Store(args.db)
+    summary = evict_to_budget(
+        store,
+        args.session,
+        args.budget,
+        protect_last=args.protect_last,
+        dry_run=args.dry_run,
+        policy=args.policy,
+    )
+    print(
+        "evict%s (%s): total %d -> %d tokens (budget %d), "
+        "evicted %d, user turns %d/%d, under budget: %s"
+        % (
+            " (dry run)" if args.dry_run else "",
+            summary["policy"],
+            summary["total_before"],
+            summary["total_after"],
+            summary["budget_tokens"],
+            summary["n_evicted"],
+            summary["user_turns_live"],
+            summary["user_turns_total"],
+            summary["under_budget"],
+        )
+    )
+    for ev in summary["evicted"]:
+        print(
+            "  episode #%d %-11s tier %d %d tokens: %s"
+            % (
+                ev["episode_id"],
+                ev["type"],
+                ev["tier"],
+                ev["tokens"],
+                ev["reason"],
+            )
+        )
+    store.close()
+
+
+def cmd_episodes(args) -> None:
+    """List a session's episodes, or explain one."""
+    store = Store(args.db)
+    if args.explain is not None:
+        print(explain_episode(store, args.explain))
+        store.close()
+        return
+    for e in store.list_episodes(args.session, status=args.status):
+        rec = store.get_record(e["record_id"])
+        print(
+            "#%-4d seq=%-3d %-11s %-8s %3d tokens persisted_by=%s  %s"
+            % (
+                e["id"],
+                e["seq"],
+                e["type"],
+                e["status"],
+                e["tokens"],
+                e["persisted_by"],
+                (rec["text"][:100] if rec else "?"),
+            )
+        )
+    store.close()
+
+
 def cmd_merges(args) -> None:
     store = Store(args.db)
     for m in store.list_merges(status=args.status):
@@ -275,6 +374,21 @@ def main() -> None:
         help="fixed-window size for the --segments control (default: "
         "mean true segment length)",
     )
+    pe.add_argument(
+        "--eviction",
+        action="store_true",
+        help="P18 eviction eval: one long session under a token "
+        "budget (CWL vs naive vs isolated sessions)",
+    )
+    pe.add_argument(
+        "--tasks", type=int, default=40,
+        help="tasks in the --eviction demo (default 40)",
+    )
+    pe.add_argument(
+        "--budget-frac", type=float, default=1.0 / 3.0,
+        help="token budget as a fraction of the full session "
+        "for --eviction (default 1/3)",
+    )
     pe.set_defaults(func=cmd_eval)
 
     ps = sub.add_parser(
@@ -329,6 +443,43 @@ def main() -> None:
     pp.add_argument("--query", required=True)
     pp.add_argument("--k", type=int, default=10)
     pp.set_defaults(func=cmd_plan)
+
+    pi2 = sub.add_parser(
+        "ingest",
+        help="P18: ingest an annotated transcript (JSONL turns) as "
+        "typed episodes in a session",
+    )
+    pi2.add_argument("--db", required=True)
+    pi2.add_argument("--session", required=True)
+    pi2.add_argument("--transcript", required=True)
+    pi2.set_defaults(func=cmd_ingest)
+
+    pv = sub.add_parser(
+        "evict",
+        help="P18: evict a session's episodes to a token budget "
+        "(CWL tiers, or --policy naive oldest-first)",
+    )
+    pv.add_argument("--db", required=True)
+    pv.add_argument("--session", required=True)
+    pv.add_argument("--budget", type=int, required=True)
+    pv.add_argument("--protect-last", type=int, default=3)
+    pv.add_argument(
+        "--policy", default="cwl", choices=["cwl", "naive"]
+    )
+    pv.add_argument("--dry-run", action="store_true")
+    pv.set_defaults(func=cmd_evict)
+
+    pe2 = sub.add_parser(
+        "episodes",
+        help="P18: list a session's episodes, or explain one "
+        "(--explain <episode id>)",
+    )
+    pe2.add_argument("--db", required=True)
+    pe2.add_argument("--session", required=True)
+    pe2.add_argument("--status", default=None,
+                     help="filter: live, evicted")
+    pe2.add_argument("--explain", type=int, default=None)
+    pe2.set_defaults(func=cmd_episodes)
 
     args = p.parse_args()
     args.func(args)
