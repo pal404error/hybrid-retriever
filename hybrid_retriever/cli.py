@@ -29,6 +29,7 @@ from .rerank import get_reranker
 from .retrieval import retrieve
 from .segments import consolidate_transcript, retrieve_planned
 from .store import Store
+from .verify import print_vbd_report, run_vbd_eval
 
 
 def cmd_index(args) -> None:
@@ -97,6 +98,15 @@ def cmd_eval(args) -> None:
             budget_frac=args.budget_frac,
         )
         print_compression_report(result)
+        return
+    if args.vbd:
+        result = run_vbd_eval(
+            os.path.join("eval_data", "synthetic_corpus.jsonl"),
+            embedder=embedder,
+            n_tasks=args.tasks,
+            k=args.k,
+        )
+        print_vbd_report(result)
         return
     if args.trace:
         result = run_synthetic_trace(
@@ -406,6 +416,17 @@ def main() -> None:
         action="store_true",
         help="P19 compression A/B eval: compress+evict vs "
         "evict-only on synthetic tool-output tasks",
+    )
+    pe.add_argument(
+        "--vbd",
+        action="store_true",
+        help="P20 verify-by-doing eval: causal lift of rule memories "
+        "on computed-answer tasks (no-memory vs bm25 / vector / "
+        "hybrid / oracle, plus leave-one-out adoption gate)",
+    )
+    pe.add_argument(
+        "--k", type=int, default=5,
+        help="memories retrieved per task for --vbd (default 5)",
     )
     pe.add_argument(
         "--tasks", type=int, default=40,

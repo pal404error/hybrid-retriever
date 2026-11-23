@@ -651,3 +651,118 @@ independent ~2% test).
   any future policy that compresses before evicting (e.g. a
   per-type budget, or compressing `reasoning` episodes too —
   currently only `tool_result` is compressed).
+
+## P20 — Verify-by-Doing (VbD) harness
+
+The paper's idea (arXiv:2611.15276): judge a memory by whether it
+helps an agent *do* the task, not by text similarity — score
+memories by task success with them vs without them, so the harness
+measures causal usefulness, not retrieval overlap. The verifier
+checks by doing: it re-parses the raw tool output and recomputes
+the expected answer itself, and reads the agent's answer back
+from the artifact file the agent wrote — it never reads the
+actor's reasoning or its memories.
+
+Two substitutions, stated plainly: there is no LLM anywhere.
+The actor is a deterministic solver that parses a tool-output
+artifact, applies the first rule memory it was given, and writes
+an answer artifact. The paper's Actor prompt + skill files become
+the rule registry in `hybrid_retriever/verify.py`, versioned in
+git; the adoption gate becomes the leave-one-out ablation (a
+rule memory is adopted only if removing it from the recalled set
+lowers task success outside noise).
+
+Tasks reuse the P19 artifact shapes (JSON list with a duplicated
+item, log tail with repeated heartbeats, table with a duplicated
+row) and the P1 synthetic corpus (160 facts) as background
+memories. The task wrappers are new — neither fixture ships a
+verifiable *doing* task — but every artifact shape and every
+background memory is reused. Each task asks for a computed
+answer (sum of scores, count of distinct messages); every task
+is a trap for the naive solver, and the handling is stated in
+exactly one rule memory in the store. The store also holds six
+distractor rule memories that prescribe the *wrong* handling
+and share more vocabulary with the question than the correct
+rule does — a lexical trap, by design. Reproduce with
+`hr eval --vbd --tasks 24`. Embedder: `onnx-all-MiniLM-L6-v2`.
+
+### Measured results — VbD (synthetic, labelled)
+
+24 tasks (8 JSON + 8 log + 8 table), store 169 records (160
+background facts + 9 rule memories), k=5 retrieved memories per
+task. Lift is paired McNemar vs the no-memory baseline on the
+same tasks (lift ± 95% CI); "outside" means |lift| > 2 SE.
+
+| arm | success | rate | lift vs no-memory |
+|---|---|---|---|
+| no-memory (baseline) | 0/24 | 0.000 | — |
+| bm25 | 8/24 | 0.333 | +0.333 ± 0.231 (outside noise) |
+| vector | 8/24 | 0.333 | +0.333 ± 0.231 (outside noise) |
+| hybrid | 8/24 | 0.333 | +0.333 ± 0.231 (outside noise) |
+| oracle (correct rule handed directly) | 24/24 | 1.000 | +1.000 ± 0.400 (outside noise) |
+
+Per-kind success rate: log 1.000 on every retrieval arm;
+JSON 0.000 and table 0.000 on every retrieval arm; oracle
+1.000 on all three kinds. k=10 gives identical results.
+
+Adoption gate (hybrid minus one correct rule memory):
+`log-distinct-only` 8/24 → 0/24, causal lift +0.333 ± 0.231
+(adopt); `json-dedup-by-id` and `table-dedup-rows` 8/24 → 8/24,
+lift +0.000 (reject — the memory never fires, so removing it
+changes nothing).
+
+The honest reading: the harness works — the baseline is 0/24,
+the ceiling is 24/24, and the retrieval arms beat the baseline
+outside noise — but the win comes entirely from the log kind,
+and the reason is instructive. The correct JSON and table rules
+*are* in the top 5 in most leg/kind combinations (vector ranks
+the JSON rule 3rd, all three legs rank the table rule 3rd);
+they lose because the solver applies the *first* firing rule
+and a distractor outranks them in every leg (JSON: "include
+every item" ranks 1st–2nd; table: "sum only the first ten
+rows" ranks 1st). Similarity ranks by topic, not by the
+correctness of the prescribed action — a wrong rule about the
+same sum is exactly as similar as the right rule, and the
+fused RRF scores across the whole top 5 sit within 0.001 of
+each other, so the ranking among the rule memories is nearly
+a coin flip. The log kind passes only because its correct rule
+happens to share the question's exact words ("distinct",
+"messages") and ranks 1st. So on this task set, retrieval
+lifts success from 0 to 1/3, and the remaining 2/3 is not a
+retrieval-recall problem — it is a rule-adjudication problem:
+given two contradictory memories, similarity cannot tell
+which one to follow. Closing it needs the feedback the
+paper's co-evolution describes — the verifier's verdicts
+feeding back into which memories get used (P2 TRACE credit
+is the mechanism this repo already has), not a better
+retriever. Publish the harness, not the headline: a memory
+that never fires has zero causal value no matter how
+retrievable it is, and the adoption gate is what catches
+that — the two rejected rules look identical to the adopted
+one in every retrieval metric.
+
+### Regressions (re-run after P20)
+
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+
+## What P20 hooks into (P21)
+
+- `run_vbd_eval` is the task-success harness P21's
+  mini-TOBench builds on: swap the deterministic solver for a
+  second agent and the computed-answer tasks for tool-use tasks,
+  and the verifier / lift / adoption-gate machinery carries over
+  unchanged.
+- The adoption gate's verdicts are the input P2's TRACE credit
+  would consume: a rule memory whose causal lift is zero should
+  lose importance, and one whose lift is positive and outside
+  noise should gain it — the VbD loop is what makes TRACE
+  credit causal instead of correlational.
