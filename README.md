@@ -33,6 +33,11 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m hybrid_retriever.cli credit --db memory.db --query "..." --answer "..."
 .venv/bin/python -m hybrid_retriever.cli sleep --db memory.db --dry-run
 .venv/bin/python -m hybrid_retriever.cli merges --db memory.db
+
+# P3 segment consolidation + query planner:
+.venv/bin/python -m hybrid_retriever.cli consolidate --db memory.db --transcript turns.jsonl [--dry-run] [--fixed-window 2]
+.venv/bin/python -m hybrid_retriever.cli plan --db memory.db --query "how does Maya maintain her bread culture"
+.venv/bin/python -m hybrid_retriever.cli eval --segments   # boundaries, consolidation cost, retrieval, planner
 ```
 
 ## Architecture
@@ -67,12 +72,23 @@ query ──┬── BM25 (FTS5) ────────────┐
   (sentence-transformers). Never a hard dependency.
 - `hybrid_retriever/eval.py` — metrics (P@10, R@10, nDCG@10,
   any-hit@5, grounding@10 = any-hit@10) and the LongMemEval-S +
-  synthetic runners, plus `run_synthetic_trace` (P2).
+  synthetic runners, plus `run_synthetic_trace` (P2) and
+  `run_segment_eval` (P3: boundary F1, consolidation cost,
+  retrieval after consolidation, planner routes).
 - `hybrid_retriever/lifecycle.py` — P2: TRACE-UCB credit
   (`record_use`), the judge-gated merge (`propose_merge` /
   `rollback_merge` / `certificate_for_merge`), merge candidates, and
   the `sleep` job. No LLM call anywhere on the write path; the judge
   is rules + the same MiniLM vectors the store already holds.
+- `hybrid_retriever/segments.py` — P3: Lychee-style lazy segment
+  consolidation (`detect_boundaries`, `classify_segment`,
+  `consolidate_transcript` / `consolidate_records`) and the query
+  planner (`plan_query` / `retrieve_planned`). Consolidation reuses
+  the P2 merge machinery with the segment profile
+  (`max_length_ratio=1.0`, type override); the planner picks one
+  route per query — temporal, typed, keyword, vector, hybrid —
+  from text cues plus cheap corpus probes, and returns the choice
+  in the `Plan` so it can be logged and evaluated.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -261,7 +277,7 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 42 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 66 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
@@ -273,22 +289,129 @@ decay, co-recall logging, the importance boost reordering
 retrieval), the merge gate (commit, three rejection reasons,
 rollback, sentence-union drafting), the sleep job (merge + prune +
 co-recall promotion, dry-run writes nothing), and the v1 database
-migration.
+migration. P3 adds: boundary detection (topic switch found,
+min/max-turns guards, semantic beats fixed-window on two topics),
+segment typing (all four types, decision wins ties), consolidation
+(closed segments merged and typed, sources superseded, dry-run
+writes nothing, single-turn segments skipped, fixed-window
+control), the type-override default (P2 merges unchanged), and the
+query planner (temporal / typed / keyword / vector routes, typed
+fallback, importance prior, `retrieve_planned`).
 
-## What P2 hooks into (P3)
+## P3 — Lychee-style lazy segment consolidation
 
-- `Store` — P3's segment consolidator needs record timestamps and
-  types (both already stored) plus the `merges` audit table, which
-  is the natural home for segment-consolidation records. No new
-  columns are needed for P3.
-- `sleep` — P3's consolidation runs as another offline job beside
-  `sleep`; the merge machinery (`draft_merge_text`,
-  `certificate_for_merge`, `propose_merge`) is reused for
-  consolidating a closed segment into typed records.
-- `importance` / `credit` — P3's query planner (pick vector vs
-  keyword vs temporal route per query) can use per-record
-  importance as a prior for route selection.
-- `eval.py` — the TRACE split runner (`run_synthetic_trace`) is
-  the fixed target P3 must improve on; re-run it after every
-  consolidation change. The LongMemEval-S runner stays the
-  regression check (P2 numbers identical to P1 — see above).
+`segments.py` implements LycheeMemory V2 (arXiv:2608.12990) on top of
+the P1 store, with the P2 merge machinery reused for consolidation.
+A transcript is buffered as `episode` records; embedding drift
+(cosine between adjacent turns below a threshold) cuts it into
+topic segments; only *closed* segments are consolidated — the last
+segment keeps buffering — into one typed record each (fact /
+decision / error-fix / preference, rule-based cues, no model). The
+query planner picks one retrieval route per query.
+
+One honest substitution vs the paper: Lychee's saving is LLM
+*construction tokens* (−86% vs per-turn consolidation). This module
+has no LLM — the "summary" of a segment is the sentence union of
+its turns — so the measured saving is in consolidation
+*operations* (one per segment instead of one per turn) and records
+created, not tokens. The eval reports those numbers, not the
+paper's.
+
+- **Boundaries** — `detect_boundaries` cuts when adjacent-turn
+  cosine drops below τ, with a min-turns guard (a lone turn never
+  forms its own segment) and a max-turns force-cut. τ=0.30 was
+  tuned on 3 dev transcripts (sweep 0.15–0.60, best F1 0.952).
+- **Consolidation** — `hr consolidate` ingests a transcript JSONL
+  file and consolidates closed segments through `propose_merge`
+  with the segment profile: `max_length_ratio=1.0` (a segment merge
+  compresses *operations*, N turns → 1 record, not words — the
+  sentence union of distinct turns cannot be shorter than its
+  inputs) and `type_override` from `classify_segment`. The
+  certificate's faithfulness and coverage checks still apply, and
+  every proposal lands in the `merges` audit table. `--dry-run`
+  judges without writing; `--fixed-window N` runs the control.
+- **Planner** — `plan_query` routes by text cues (temporal words →
+  recent records; decision/preference words → that type; quoted
+  phrase → BM25) plus a cheap 5-hit BM25/vector probe: no hits on
+  one leg → the other; legs disagree → hybrid; legs agree →
+  keyword only when *every* content term appears in the corpus,
+  else vector. Per-record importance/credit feeds the P2 hook
+  (`importance_weight=0.5` when the probe's hits average > 0.6).
+  Two rules were fixed after the first eval run (see below):
+  the keyword bar was raised from "most terms appear" (≥ 0.6) to
+  "all terms appear" (= 1.0), and error-fix type cues were dropped
+  — "fix"/"bug" are topic words in queries, not type signals, and
+  routing on them restricted candidates away from the gold record.
+  The planner is opt-in (`retrieve_planned` / `hr plan`), not the
+  default: it trades a few accuracy points for ~3× fewer leg runs.
+
+### Measured results — segment eval (synthetic, labelled)
+
+6 transcripts built from the corpus (116 turns, 8 people × 6
+attributes, runs of 2–3 turns; traps excluded), 3 dev + 3 held-out.
+Embedder: `onnx-all-MiniLM-L6-v2`. Reproduce with
+`hr eval --segments`. The paper's headline (89.22% vs 82.40%
+LoCoMo, semantic vs fixed-window) holds here in boundary F1:
+
+| boundaries (held-out) | P | R | F1 |
+|---|---|---|---|
+| semantic (τ=0.30) | 1.000 | 0.905 | **0.949** |
+| fixed-window (window=2) | 0.261 | 0.333 | 0.292 |
+
+| consolidation | ops | live records |
+|---|---|---|
+| per-turn (baseline) | 116 | 116 |
+| semantic | **40** (2.9× fewer) | 56 |
+| fixed-window | 54 | 62 |
+
+Retrieval after consolidation (hybrid, no MMR, all 104 queries).
+**Read R@10 with care:** consolidation shrinks the gold set (3
+turn records → 1 segment record), so hitting the single gold
+record scores R@10 1.0 — the numbers are not comparable across
+stores. any-hit@5 is the apples-to-apples metric. Consolidation
+helps it because each attribute's evidence is concentrated in one
+record, where single turns matched only part of a query:
+
+| any-hit@5 | paraphrase | keyword | trap |
+|---|---|---|---|
+| raw turns | 0.812 | 1.000 | 0.625 |
+| semantic-consolidated | **0.958** | 1.000 | **0.750** |
+| fixed-window-consolidated | 0.896 | 1.000 | 0.750 |
+
+Planner vs plain hybrid on the semantic store (same 104 queries):
+
+| any-hit@5 | paraphrase | keyword | trap |
+|---|---|---|---|
+| hybrid | 0.958 | 1.000 | 0.750 |
+| planner | 0.896 | 1.000 | 0.625 |
+
+Routes chosen: paraphrase → vector 42, keyword 2, temporal 2,
+typed 1, hybrid 1; keyword → keyword 32, vector 16; trap →
+vector 5, keyword 2, hybrid 1. The first version of the rule
+(hit_frac ≥ 0.6, error-fix type cues) was much worse — paraphrase
+hit@5 0.771, trap 0.500 — because it misrouted paraphrase queries
+to BM25, which cannot match synonyms. The fixed rule keeps the
+planner within a few points of hybrid while running one leg
+instead of three on most queries. Trap queries stay the weak
+spot: they are built to have high lexical overlap, so any
+lexical signal routes them to the leg they are designed to fool.
+
+### Measured results — LongMemEval-S regression (real, 50Q)
+
+Re-run after P3: numbers are **identical** to the P1/P2 table
+(bm25 R@10 1.000, vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+Consolidation is a separate offline job, so the standard retrieval
+path is untouched — the regression check confirms it.
+
+## What P3 hooks into (P4)
+
+- `Store` — segment records are typed and carry `importance` /
+  `credit` / `uses` exactly like other records; the `merges`
+  table already records which turns each segment absorbed, so P4's
+  graph can link segments (co-recall between segments) without a
+  new table.
+- `plan_query` — the planner's route log is the signal P4's
+  adaptive search can learn from: which routes win per query kind.
+- `eval.py` — `run_segment_eval` is the fixed target P4 must not
+  regress: boundary F1 0.949, consolidation 40 ops, semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
