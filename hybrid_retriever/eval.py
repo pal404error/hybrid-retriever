@@ -397,3 +397,324 @@ def run_synthetic(
         "embedder": embedder.name,
         "scores": average_scores(per_question),
     }
+
+
+# ----------------------------------------------------------------------
+# P3 segment eval
+# ----------------------------------------------------------------------
+def build_transcripts(
+    records: list[dict],
+    n_transcripts: int = 6,
+    runs_per_transcript: int = 8,
+    run_len: tuple[int, int] = (2, 3),
+    seed: int = 42,
+) -> list[dict]:
+    """Turn the synthetic corpus into transcripts with known boundaries.
+
+    A topic run is one attribute (3 records); each run keeps 2–3 of
+    them, in original order. Runs are shuffled into transcripts.
+    Trap records are excluded — they are distractors for queries,
+    not topics. Returns [{"turns": [{"key", "text"}], "boundaries":
+    {positions where a new run starts}}]. Every attribute is used
+    exactly once, so the transcripts cover the whole corpus.
+    """
+    import random
+
+    rng = random.Random(seed)
+    by_attr: dict[str, list[dict]] = {}
+    for r in records:
+        if r["key"].startswith("trap-"):
+            continue
+        by_attr.setdefault(r["key"].rsplit("-", 1)[0], []).append(r)
+    runs = []
+    for attr in sorted(by_attr):
+        recs = by_attr[attr]
+        n = rng.randint(*run_len)
+        runs.append(rng.sample(recs, min(n, len(recs))))
+    rng.shuffle(runs)
+    transcripts = []
+    for t in range(n_transcripts):
+        chunk = runs[
+            t * runs_per_transcript : (t + 1) * runs_per_transcript
+        ]
+        turns: list[dict] = []
+        boundaries: set[int] = set()
+        for run in chunk:
+            if turns:
+                boundaries.add(len(turns))
+            turns.extend(
+                {"key": r["key"], "text": r["text"]} for r in run
+            )
+        transcripts.append({"turns": turns, "boundaries": boundaries})
+    return transcripts
+
+
+def run_segment_eval(
+    corpus_path: str,
+    queries_path: str,
+    embedder=None,
+    threshold: float | None = None,
+    window: int | None = None,
+    verbose: bool = True,
+) -> dict:
+    """P3 eval: boundaries, consolidation cost, retrieval after it.
+
+    Threshold tuning: the first half of the transcripts is the dev
+    set (sweep tau 0.15–0.60, best mean F1 wins); the second half is
+    held out. The fixed-window control uses window = the mean true
+    segment length, rounded. Retrieval compares three stores over
+    the same 104 queries: raw turns, semantic-consolidated, and
+    fixed-window-consolidated. The planner is scored on the
+    semantic store: route distribution per query kind, and
+    per-kind accuracy vs plain hybrid on the same store.
+    """
+    from .segments import (
+        boundary_f1,
+        boundary_positions,
+        consolidate_transcript,
+        detect_boundaries,
+        detect_boundaries_fixed_window,
+        retrieve_planned,
+    )
+
+    embedder = embedder or get_embedder()
+    records, queries = load_synthetic(corpus_path, queries_path)
+    transcripts = build_transcripts(records)
+    dev, heldout = transcripts[:3], transcripts[3:]
+
+    # --- threshold sweep on dev -------------------------------------
+    sweep = {}
+    for tau in [round(0.15 + 0.05 * i, 2) for i in range(10)]:
+        f1s = []
+        for tr in dev:
+            texts = [t["text"] for t in tr["turns"]]
+            pred = boundary_positions(
+                detect_boundaries(texts, embedder, threshold=tau)
+            )
+            f1s.append(boundary_f1(pred, tr["boundaries"])["f1"])
+        sweep[tau] = sum(f1s) / len(f1s)
+    best_tau = max(sweep, key=lambda t: sweep[t])
+    tau = threshold if threshold is not None else best_tau
+
+    # --- boundaries on held-out --------------------------------------
+    def _boundary_scores(transcripts, fn):
+        per = []
+        for tr in transcripts:
+            texts = [t["text"] for t in tr["turns"]]
+            pred = boundary_positions(fn(texts))
+            per.append(boundary_f1(pred, tr["boundaries"]))
+        return {
+            m: sum(p[m] for p in per) / len(per)
+            for m in ("precision", "recall", "f1")
+        }
+
+    mean_seg_len = sum(
+        len(tr["turns"]) / (len(tr["boundaries"]) + 1)
+        for tr in transcripts
+    ) / len(transcripts)
+    win = window if window is not None else max(2, round(mean_seg_len))
+    sem_scores = _boundary_scores(
+        heldout,
+        lambda texts: detect_boundaries(texts, embedder, threshold=tau),
+    )
+    fw_scores = _boundary_scores(
+        heldout,
+        lambda texts: detect_boundaries_fixed_window(len(texts), win),
+    )
+    if verbose:
+        print(
+            "threshold sweep (dev, %d transcripts): best tau=%.2f "
+            "F1=%.3f; using tau=%.2f; fixed window=%d (mean true "
+            "segment length %.2f)"
+            % (len(dev), best_tau, sweep[best_tau], tau, win, mean_seg_len)
+        )
+
+    # --- three stores: raw / semantic / fixed-window -----------------
+    def _build(kind: str):
+        tmp = tempfile.mkdtemp(prefix="hr-seg-")
+        store = Store(os.path.join(tmp, "eval.db"), embedder=embedder)
+        key_to_rid: dict[str, int] = {}
+        summaries = []
+        for tr in transcripts:
+            turns = [{"text": t["text"]} for t in tr["turns"]]
+            if kind == "raw":
+                from .segments import ingest_transcript
+
+                ids = ingest_transcript(store, turns)
+                summaries.append({"turns_ingested": len(ids)})
+            else:
+                s = consolidate_transcript(
+                    store,
+                    embedder,
+                    turns,
+                    threshold=tau,
+                    fixed_window=win if kind == "fixed" else None,
+                )
+                summaries.append(s)
+                # The turns just ingested are the last len(turns)
+                # episode records, in order.
+                ids = [
+                    row[0]
+                    for row in store.conn.execute(
+                        "SELECT id FROM records WHERE type = 'episode' "
+                        "ORDER BY id DESC LIMIT ?",
+                        (len(turns),),
+                    ).fetchall()
+                ][::-1]
+            for t, rid in zip(tr["turns"], ids):
+                key_to_rid[t["key"]] = rid
+        # Gold mapping: a turn key maps to its live record — the
+        # segment record that absorbed it, or the turn itself when
+        # it was left open / single-turn / raw.
+        gold_map: dict[str, set[int]] = {}
+        seg_of_turn: dict[int, int] = {}
+        for m in store.list_merges(status="committed"):
+            for src in m["merged_ids"]:
+                seg_of_turn[src] = m["merged_record_id"]
+        for k, rid in key_to_rid.items():
+            gold_map[k] = {seg_of_turn.get(rid, rid)}
+        stats = {
+            "turns": sum(s["turns_ingested"] for s in summaries),
+            "segments_consolidated": sum(
+                s.get("consolidated", 0) for s in summaries
+            ),
+            "rejected": sum(s.get("rejected", 0) for s in summaries),
+            "live_records": store.count_live(),
+        }
+        return store, gold_map, stats
+
+    def _score_store(store, gold_map, use_planner=False):
+        per_kind: dict[str, list[dict]] = {}
+        routes: dict[str, dict[str, int]] = {}
+        for q in queries:
+            gold: set[int] = set()
+            for k in q["gold_keys"]:
+                gold |= gold_map.get(k, set())
+            if use_planner:
+                res, plan = retrieve_planned(
+                    store, embedder, q["question"], k=10
+                )
+                routes.setdefault(q["kind"], {}).setdefault(
+                    plan.route, 0
+                )
+                routes[q["kind"]][plan.route] += 1
+                ranked = [r.id for r in res]
+            else:
+                ranked = [
+                    r.id
+                    for r in retrieve(
+                        store, embedder, q["question"], k=10, use_mmr=False
+                    )
+                ]
+            per_kind.setdefault(q["kind"], []).append(
+                {
+                    "R@10": recall_at_k(ranked, gold),
+                    "any-hit@5": any_hit_at_k(ranked, gold, 5),
+                }
+            )
+        scores = {
+            kind: {
+                m: sum(p[m] for p in per) / len(per)
+                for m in ("R@10", "any-hit@5")
+            }
+            for kind, per in per_kind.items()
+        }
+        return scores, routes
+
+    built = {kind: _build(kind) for kind in ("raw", "semantic", "fixed")}
+    retrieval = {}
+    for kind in ("raw", "semantic", "fixed"):
+        store, gold_map, _ = built[kind]
+        retrieval[kind], _ = _score_store(store, gold_map)
+    # Planner on the semantic store, while it is still open.
+    sem_store, sem_gold, _ = built["semantic"]
+    planner_scores, routes = _score_store(
+        sem_store, sem_gold, use_planner=True
+    )
+    for store, _, _ in built.values():
+        store.close()
+    stats = {kind: built[kind][2] for kind in built}
+
+    return {
+        "corpus": "synthetic transcripts (labelled)",
+        "n_transcripts": len(transcripts),
+        "n_turns": stats["raw"]["turns"],
+        "embedder": embedder.name,
+        "threshold": tau,
+        "threshold_sweep": {str(k): round(v, 3) for k, v in sweep.items()},
+        "fixed_window": win,
+        "boundary_semantic": {
+            k: round(v, 3) for k, v in sem_scores.items()
+        },
+        "boundary_fixed_window": {
+            k: round(v, 3) for k, v in fw_scores.items()
+        },
+        "consolidation": {
+            "per_turn_ops": stats["raw"]["turns"],
+            "semantic_ops": stats["semantic"]["segments_consolidated"],
+            "fixed_ops": stats["fixed"]["segments_consolidated"],
+            "semantic_live_records": stats["semantic"]["live_records"],
+            "fixed_live_records": stats["fixed"]["live_records"],
+            "raw_live_records": stats["raw"]["live_records"],
+        },
+        "retrieval": retrieval,
+        "planner": {"scores": planner_scores, "routes": routes},
+    }
+
+
+def print_segment_report(result: dict) -> None:
+    print("\n== %s ==" % result["corpus"])
+    print(
+        "transcripts: %d   turns: %d   embedder: %s   tau=%.2f   "
+        "fixed window=%d"
+        % (
+            result["n_transcripts"],
+            result["n_turns"],
+            result["embedder"],
+            result["threshold"],
+            result["fixed_window"],
+        )
+    )
+    print(
+        "boundaries (held-out): semantic P=%.3f R=%.3f F1=%.3f | "
+        "fixed-window P=%.3f R=%.3f F1=%.3f"
+        % (
+            result["boundary_semantic"]["precision"],
+            result["boundary_semantic"]["recall"],
+            result["boundary_semantic"]["f1"],
+            result["boundary_fixed_window"]["precision"],
+            result["boundary_fixed_window"]["recall"],
+            result["boundary_fixed_window"]["f1"],
+        )
+    )
+    c = result["consolidation"]
+    print(
+        "consolidation ops: per-turn=%d  semantic=%d  fixed-window=%d"
+        "  (live records: raw=%d semantic=%d fixed=%d)"
+        % (
+            c["per_turn_ops"],
+            c["semantic_ops"],
+            c["fixed_ops"],
+            c["raw_live_records"],
+            c["semantic_live_records"],
+            c["fixed_live_records"],
+        )
+    )
+    for kind in ("raw", "semantic", "fixed"):
+        print("retrieval (%s):" % kind)
+        for qkind, m in result["retrieval"][kind].items():
+            print(
+                "  %-10s R@10=%.3f any-hit@5=%.3f"
+                % (qkind, m["R@10"], m["any-hit@5"])
+            )
+    print("planner (on semantic store):")
+    for qkind, m in result["planner"]["scores"].items():
+        print(
+            "  %-10s R@10=%.3f any-hit@5=%.3f  routes=%s"
+            % (
+                qkind,
+                m["R@10"],
+                m["any-hit@5"],
+                result["planner"]["routes"].get(qkind, {}),
+            )
+        )

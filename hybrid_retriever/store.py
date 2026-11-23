@@ -454,6 +454,38 @@ class Store:
         self.conn.commit()
 
     # -- reads ---------------------------------------------------------
+    def doc_freq(self, term: str) -> int:
+        """How many records contain ``term`` (FTS5, exact term).
+
+        P3 planner signal: a query whose content terms mostly appear
+        in the corpus is lexical (BM25 can answer); one whose terms
+        mostly don't is a paraphrase (only the vector leg can).
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM records_fts WHERE records_fts MATCH ?",
+            ('"%s"' % term.lower(),),
+        ).fetchone()
+        return int(row[0])
+
+    def recent_live_ids(
+        self, days: float = 7.0, limit: int = 200
+    ) -> list[int]:
+        """Live record ids created in the last ``days`` days, newest first."""
+        rows = self.conn.execute(
+            "SELECT id FROM records WHERE status = 'live' "
+            "AND created_at >= ? ORDER BY created_at DESC LIMIT ?",
+            (time.time() - days * 86400.0, limit),
+        ).fetchall()
+        return [int(r[0]) for r in rows]
+
+    def live_ids_by_type(self, type_: str) -> list[int]:
+        """Live record ids of one type (P3 planner's typed route)."""
+        rows = self.conn.execute(
+            "SELECT id FROM records WHERE status = 'live' AND type = ?",
+            (type_,),
+        ).fetchall()
+        return [int(r[0]) for r in rows]
+
     def count(self) -> int:
         return int(
             self.conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]

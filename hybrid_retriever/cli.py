@@ -1,4 +1,4 @@
-"""Command line: index a corpus, run a query, run the eval, sleep, credit, merges."""
+"""Command line: index a corpus, run a query, run the eval, sleep, credit, merges, consolidate, plan."""
 
 from __future__ import annotations
 
@@ -7,10 +7,18 @@ import json
 import os
 
 from .embeddings import get_embedder
-from .eval import print_report, run_longmemeval, run_synthetic, run_synthetic_trace
+from .eval import (
+    print_report,
+    print_segment_report,
+    run_longmemeval,
+    run_segment_eval,
+    run_synthetic,
+    run_synthetic_trace,
+)
 from .lifecycle import record_use, sleep
 from .rerank import get_reranker
 from .retrieval import retrieve
+from .segments import consolidate_transcript, retrieve_planned
 from .store import Store
 
 
@@ -51,6 +59,16 @@ def cmd_query(args) -> None:
 
 def cmd_eval(args) -> None:
     embedder = get_embedder()
+    if args.segments:
+        result = run_segment_eval(
+            os.path.join("eval_data", "synthetic_corpus.jsonl"),
+            os.path.join("eval_data", "synthetic_queries.json"),
+            embedder=embedder,
+            threshold=args.threshold,
+            window=args.window,
+        )
+        print_segment_report(result)
+        return
     if args.trace:
         result = run_synthetic_trace(
             os.path.join("eval_data", "synthetic_corpus.jsonl"),
@@ -133,6 +151,63 @@ def cmd_credit(args) -> None:
     store.close()
 
 
+def cmd_consolidate(args) -> None:
+    """Ingest a transcript file, consolidate its closed segments."""
+    embedder = get_embedder()
+    store = Store(args.db, embedder=embedder)
+    with open(args.transcript, encoding="utf-8") as f:
+        turns = [json.loads(line) for line in f if line.strip()]
+    summary = consolidate_transcript(
+        store,
+        embedder,
+        turns,
+        threshold=args.threshold,
+        min_turns=args.min_turns,
+        max_turns=args.max_turns,
+        fixed_window=args.fixed_window,
+        dry_run=args.dry_run,
+    )
+    print(
+        "consolidate%s: turns=%d segments=%d closed=%d consolidated=%d "
+        "rejected=%d skipped-single-turn=%d left-open-turns=%d "
+        "(live records: %d)"
+        % (
+            " (dry run)" if args.dry_run else "",
+            summary["turns_ingested"],
+            summary["segments"],
+            summary["closed_segments"],
+            summary["consolidated"],
+            summary["rejected"],
+            summary["skipped_single_turn"],
+            summary["left_open"],
+            store.count_live(),
+        )
+    )
+    store.close()
+
+
+def cmd_plan(args) -> None:
+    """Show the query planner's route, then run it."""
+    embedder = get_embedder()
+    store = Store(args.db, embedder=embedder)
+    results, plan = retrieve_planned(store, embedder, args.query, k=args.k)
+    print(
+        "route=%s weights=%s importance_weight=%.1f  (%s)"
+        % (
+            plan.route,
+            "/".join("%.2f" % w for w in plan.weights),
+            plan.importance_weight,
+            plan.reason,
+        )
+    )
+    for r in results:
+        print(
+            "#%-4d score=%.4f legs=%s  %s"
+            % (r.id, r.score, ",".join(sorted(r.legs)), r.text[:160])
+        )
+    store.close()
+
+
 def cmd_merges(args) -> None:
     store = Store(args.db)
     for m in store.list_merges(status=args.status):
@@ -184,6 +259,22 @@ def main() -> None:
         "--ucb-c", type=float, default=1.0,
         help="TRACE-UCB exploration constant for --trace (default 1.0)",
     )
+    pe.add_argument(
+        "--segments",
+        action="store_true",
+        help="P3 segment eval: boundaries, consolidation cost, "
+        "retrieval after consolidation, planner routes",
+    )
+    pe.add_argument(
+        "--threshold", type=float, default=None,
+        help="boundary cosine threshold for --segments (default: "
+        "tuned on the dev transcripts)",
+    )
+    pe.add_argument(
+        "--window", type=int, default=None,
+        help="fixed-window size for the --segments control (default: "
+        "mean true segment length)",
+    )
     pe.set_defaults(func=cmd_eval)
 
     ps = sub.add_parser(
@@ -212,6 +303,32 @@ def main() -> None:
     pm.add_argument("--status", default=None,
                     help="filter: committed, rejected, rolled-back")
     pm.set_defaults(func=cmd_merges)
+
+    pc2 = sub.add_parser(
+        "consolidate",
+        help="P3 offline job: ingest a transcript (JSONL turns) and "
+        "consolidate its closed segments into typed records",
+    )
+    pc2.add_argument("--db", required=True)
+    pc2.add_argument("--transcript", required=True)
+    pc2.add_argument("--threshold", type=float, default=0.30)
+    pc2.add_argument("--min-turns", type=int, default=2)
+    pc2.add_argument("--max-turns", type=int, default=12)
+    pc2.add_argument(
+        "--fixed-window", type=int, default=None,
+        help="use fixed-window batching instead of semantic "
+        "boundaries (the control)",
+    )
+    pc2.add_argument("--dry-run", action="store_true")
+    pc2.set_defaults(func=cmd_consolidate)
+
+    pp = sub.add_parser(
+        "plan", help="P3 query planner: show the chosen route, then run it"
+    )
+    pp.add_argument("--db", required=True)
+    pp.add_argument("--query", required=True)
+    pp.add_argument("--k", type=int, default=10)
+    pp.set_defaults(func=cmd_plan)
 
     args = p.parse_args()
     args.func(args)

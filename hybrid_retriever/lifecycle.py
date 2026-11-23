@@ -349,6 +349,7 @@ def propose_merge(
     source_ids: list[int],
     merged_text: str | None = None,
     dry_run: bool = False,
+    type_override: str | None = None,
     **cert_kwargs,
 ) -> MergeResult:
     """Draft (if needed), judge, and commit or reject a merge.
@@ -356,7 +357,9 @@ def propose_merge(
     On commit the merged record goes live, the sources are marked
     'superseded' (never deleted), and the audit row is written. On
     reject only the audit row is written. Dry-run judges without
-    writing anything.
+    writing anything. ``type_override`` (P3) labels the merged
+    record with the segment's classified type instead of the
+    sources' type.
     """
     sources = [
         r
@@ -398,7 +401,7 @@ def propose_merge(
     tags = sorted({t for s in sources for t in s["tags"]})
     merged_id = store.add_record(
         text,
-        type_=sources[0]["type"],
+        type_=type_override or sources[0]["type"],
         tags=tags,
         meta={"merged_from": [s["id"] for s in sources]},
         embedding=(
