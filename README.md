@@ -38,6 +38,12 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m hybrid_retriever.cli consolidate --db memory.db --transcript turns.jsonl [--dry-run] [--fixed-window 2]
 .venv/bin/python -m hybrid_retriever.cli plan --db memory.db --query "how does Maya maintain her bread culture"
 .venv/bin/python -m hybrid_retriever.cli eval --segments   # boundaries, consolidation cost, retrieval, planner
+
+# P18 structured context eviction:
+.venv/bin/python -m hybrid_retriever.cli ingest --db memory.db --session s1 --transcript turns.jsonl
+.venv/bin/python -m hybrid_retriever.cli evict --db memory.db --session s1 --budget 2000 [--policy naive] [--dry-run]
+.venv/bin/python -m hybrid_retriever.cli episodes --db memory.db --session s1 [--explain 12]
+.venv/bin/python -m hybrid_retriever.cli eval --eviction   # long session vs naive vs isolated
 ```
 
 ## Architecture
@@ -89,6 +95,14 @@ query ──┬── BM25 (FTS5) ────────────┐
   route per query — temporal, typed, keyword, vector, hybrid —
   from text cues plus cheap corpus probes, and returns the choice
   in the `Plan` so it can be logged and evaluated.
+- `hybrid_retriever/eviction.py` — P18: CWL structured context
+  eviction (`annotate_episode` / `ingest_session`,
+  `evict_to_budget`, `explain_episode`). Episodes are the context
+  (typed, dependency-linked, in `episodes`); records are the
+  memory. Eviction removes from context, never deletes a record;
+  every eviction lands in the `evictions` audit table with its
+  reason. Tokens are estimated deterministically
+  (`ceil(len(text) / 4)`); no LLM, no model, no tokenizer.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -277,13 +291,18 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 66 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 79 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
 RRF fusion math, MMR diversity, end-to-end hybrid retrieval, graph
 expansion, the ONNX embedder's paraphrase gap, and the empty-query
 edge case (zero-vector queries return nothing, not the whole store).
+P2 adds TRACE credit, the merge certificate (including rejections),
+rollback, sleep and v1 migration; P3 adds boundaries, segment
+typing, consolidation and planner routing; P18 adds episode
+annotation, eviction tiers and protections, budget enforcement,
+explainability, and the naive-vs-CWL contrast.
 P2 adds: TRACE credit (used vs unused, importance ordering and
 decay, co-recall logging, the importance boost reordering
 retrieval), the merge gate (commit, three rejection reasons,
@@ -415,3 +434,109 @@ path is untouched — the regression check confirms it.
 - `eval.py` — `run_segment_eval` is the fixed target P4 must not
   regress: boundary F1 0.949, consolidation 40 ops, semantic
   any-hit@5 0.958 / 1.000 / 0.750.
+
+## P18 — CWL structured context eviction
+
+`eviction.py` implements Beyond Compaction / CWL (arXiv:2606.11213)
+on top of the P1–P3 store. One delimiter tool annotates the
+trajectory as typed, dependency-linked episodes as work proceeds;
+a deterministic, LLM-free policy evicts in priority order when a
+token budget is exceeded.
+
+**Episodes, not turns.** `hr ingest` stores each turn as an
+`episode` record plus an `episodes` row: a type (`user` /
+`reasoning` / `tool_call` / `tool_result` / `decision` /
+`error_fix` / `preference` / `fact` / `chatter`), a dependency
+list, a `persisted_by` record id, and a token estimate. Role
+defaults apply (`user` → `user`, `tool` → `tool_result`,
+assistant → `reasoning` unless the text carries decision /
+error-fix / preference cues); an explicit `episode_type` on the
+turn always wins. A `tool_result` with no stated dependency is
+linked to the latest preceding `tool_call` — a result without its
+call is meaningless. `mark_session_persisted_by_merges` wires P3
+consolidation in: once a segment record absorbs a turn, that
+turn's episode is marked persisted by it.
+
+**Eviction tiers** (lower evicted first): 0 persisted
+`tool_result`, 1 `chatter`, 2 persisted `tool_call`, 3 any
+persisted episode, 4 unpersisted `reasoning`, 5 unpersisted
+`decision` / `error_fix`, 6 unpersisted `tool_call` /
+`tool_result` (evicting loses information — last resort). Within
+a tier: older first, then lower importance, then fewer uses.
+Hard protections, never broken for a budget: user turns, the
+active window (last 3 episodes), and any episode a still-live
+episode depends on (checked dynamically, so evicting the
+dependent first frees its dependency). If the protections make
+the budget unreachable, the policy evicts everything evictable
+and reports `under_budget=False` with the overage. Every
+eviction is written to the `evictions` audit table with its
+reason; `hr episodes --explain <id>` explains any episode from
+the log, or why a live one stays. `--dry-run` reports
+`would_evict` and writes nothing. The naive control
+(`--policy naive`) is oldest-first truncation with the same
+active window but no tiers, no user-turn protection and no
+dependency protection.
+
+### Measured results — eviction demo (synthetic, labelled)
+
+40 tasks (20 keyword + 20 paraphrase queries, distinct
+attributes), 7 turns each, 3229 tokens total, budget 1076 (33%).
+After each task the session consolidates the task's non-user
+turns into one segment record (user turns are the conversation,
+not facts to merge), marks absorbed episodes persisted, and
+evicts to budget. Reproduce with `hr eval --eviction`. Embedder:
+`onnx-all-MiniLM-L6-v2`.
+
+| arm | task hit@5 | user-turn recall | user turns | live tokens | dep. violations |
+|---|---|---|---|---|---|
+| isolated (per task) | 1.000 | 1.000 | — | — | — |
+| CWL | **1.000** | **1.000** | 40/40 | 1076 | 0 |
+| naive (oldest-first) | 1.000 | 0.275 | 11/40 | 1073 | 1 |
+
+CWL evicted 194 episodes (tier 0: 118, tier 1: 39, tier 2: 37)
+— every one of them persisted, so nothing was lost. Naive
+evicted 201 with no tier structure.
+
+The honest reading: task accuracy holds in *both* long arms
+because P3 consolidation preserves the facts in segment records
+— eviction is not what saves the facts, consolidation is. The
+policy's value is in the conversation, not the facts: CWL keeps
+every user turn in context (recall 1.000 vs 0.275) and never
+strands a dependent (0 vs 1 violation), while naive truncation
+destroys the conversation it is supposed to be working in. That
+is exactly the paper's claim in the form that applies here: a
+long session inside a fixed budget with no accuracy degradation
+vs isolated sessions.
+
+One bug was caught by the first demo run and fixed: the first
+version scored task questions by matching stored turn text
+against corpus gold texts, but stored turns carry a `"role: "`
+prefix the corpus texts do not have, so every long-arm task
+scored 0.000. Gold is now tracked by record id at ingest time,
+and the demo smoke test pins the fixed behaviour.
+
+### Regressions (re-run after P18)
+
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+
+## What P18 hooks into (P19)
+
+- `evict_to_budget` runs on any session store, so P19's
+  type-aware compressor can sit *inside* the eviction loop: when
+  the budget is exceeded, compress a tool_result episode's JSON
+  first (P19) and only evict it if it still does not fit.
+- `context_record_ids` is the retrieval surface P19's A/B
+  harness should score against — compressed vs raw recall over
+  the same live context.
+- The `evictions` audit table is the measurement log for P19:
+  tokens freed per eviction vs tokens saved per compression, on
+  the same sessions.
+- `eval.py` — `run_eviction_eval` is the fixed target P19 must
+  not regress: CWL task hit@5 1.000, user-turn recall 1.000,
+  40/40 user turns, 0 dependency violations, at budget 1076.
