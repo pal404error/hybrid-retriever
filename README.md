@@ -27,6 +27,12 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # Run the evals:
 .venv/bin/python -m hybrid_retriever.cli eval --dataset synthetic
 .venv/bin/python -m hybrid_retriever.cli eval --dataset eval_data/longmemeval_s_cleaned.json --limit 50 --rerank
+.venv/bin/python -m hybrid_retriever.cli eval --trace   # TRACE split eval (P2)
+
+# P2 lifecycle commands:
+.venv/bin/python -m hybrid_retriever.cli credit --db memory.db --query "..." --answer "..."
+.venv/bin/python -m hybrid_retriever.cli sleep --db memory.db --dry-run
+.venv/bin/python -m hybrid_retriever.cli merges --db memory.db
 ```
 
 ## Architecture
@@ -61,7 +67,108 @@ query ──┬── BM25 (FTS5) ────────────┐
   (sentence-transformers). Never a hard dependency.
 - `hybrid_retriever/eval.py` — metrics (P@10, R@10, nDCG@10,
   any-hit@5, grounding@10 = any-hit@10) and the LongMemEval-S +
-  synthetic runners.
+  synthetic runners, plus `run_synthetic_trace` (P2).
+- `hybrid_retriever/lifecycle.py` — P2: TRACE-UCB credit
+  (`record_use`), the judge-gated merge (`propose_merge` /
+  `rollback_merge` / `certificate_for_merge`), merge candidates, and
+  the `sleep` job. No LLM call anywhere on the write path; the judge
+  is rules + the same MiniLM vectors the store already holds.
+
+## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
+
+`lifecycle.py` implements MEMOIR (arXiv:2611.07631) on top of the P1
+store. Records carry `importance` / `credit` / `uses` / `last_used`
+plus a `status` (`live` / `superseded` / `pending` / `pruned` /
+`archived`); search legs only ever return `live` records. v1
+databases are migrated in place (columns added by `ALTER TABLE`).
+
+- **TRACE-UCB** — after each answer, `record_use` attributes credit
+  from lexical overlap with the answer, times a leave-one-out
+  uniqueness factor (the share of the overlap no other retrieved
+  record also explains), times a small legs-agreement multiplier.
+  Importance is mean credit + a UCB exploration bonus
+  (`c * sqrt(ln(N+1) / uses)`, neutral prior 0.5). `retrieve(...,
+  importance_weight=w)` multiplies the fused RRF score by
+  `1 + w * normalised_importance`; w = 0 is exactly P1 behaviour.
+- **Judge-gated merge** — `propose_merge` drafts a merged text by
+  sentence union (no LLM, so faithfulness holds by construction)
+  and runs the sufficiency certificate: faithfulness ≥ 0.95,
+  coverage ≥ 0.45, length ≤ 0.90, mean source similarity ≥ 0.30.
+  On pass the merged record goes live and the sources are marked
+  `superseded` (never deleted); on fail only the rejected audit row
+  is written. Every proposal lands in the `merges` table;
+  `rollback_merge` restores the sources. `hr merges` lists the audit
+  table.
+- **Sleep** (`hr sleep`) — the offline job: propose merges for
+  near-duplicate clusters (word-set Jaccard ≥ 0.9, or cosine ≥ 0.90
+  for pairs sharing half their tokens), prune dead memories (never
+  used, zero credit, older than `--prune-days`, default 90), and
+  promote co-recall pairs (used together for one answer, count ≥ 2)
+  to `co-recall` graph edges. `--dry-run` reports without writing.
+
+### Measured results — TRACE split (synthetic, labelled)
+
+Warm-up on the 48 keyword queries (credit attributed against the
+gold records' text as the answer proxy), eval on the 48 paraphrase +
+8 trap queries. The split tests whether credit learned from one
+phrasing transfers to another phrasing of the same facts; warming up
+on the eval queries themselves would be training on the test set.
+Embedder: `onnx-all-MiniLM-L6-v2`. Reproduce with
+`hr eval --trace [--ucb-c 0.3]`.
+
+| mode | P@10 | R@10 | nDCG@10 | any-hit@5 | grounding@10 |
+|---|---|---|---|---|---|
+| vector (bare cosine) | 0.223 | 0.744 | 0.626 | 0.875 | 0.911 |
+| hybrid | 0.118 | 0.393 | 0.297 | 0.589 | 0.768 |
+| hybrid+trace w=0.5, ucb_c=1.0 | 0.136 | 0.452 | 0.325 | 0.571 | 0.911 |
+| hybrid+trace w=1.0, ucb_c=1.0 | 0.141 | 0.470 | 0.330 | 0.536 | 0.946 |
+| hybrid+trace w=0.5, ucb_c=0.3 | 0.138 | 0.458 | 0.340 | **0.661** | 0.893 |
+| hybrid+trace w=1.0, ucb_c=0.3 | 0.145 | 0.482 | 0.341 | 0.571 | 0.929 |
+| hybrid+trace w=2.0, ucb_c=0.3 | 0.139 | 0.464 | 0.325 | 0.607 | 0.929 |
+
+**Honest reading:** TRACE works as designed but does not close the
+gap to bare cosine on this corpus. With the textbook exploration
+constant (ucb_c=1.0) the bonus swamps the credit signal after a
+single warm-up pass — every once-retrieved record, distractor or
+not, gets boosted, so recall@5 *falls* while R@10 rises. With
+ucb_c=0.3 the credit signal dominates and recall@5 improves
+0.589 → 0.661 (+7.2pp) at w=0.5, with R@10 up 0.393 → 0.458.
+The weight sweet spot is 0.5; heavier weights push more gold into
+the top 10 but not the top 5. And bare cosine still wins outright
+(0.875) — the same P1 finding: on this paraphrase-heavy corpus the
+vector leg dominates and the fixed-weight hybrid dilutes it. TRACE
+is a partial fix for the hybrid, not a cure for the weighting
+problem. The code default stays at ucb_c=1.0 (standard UCB1); the
+CLI exposes `--ucb-c` because the measurement says 0.3 is better
+for this workload.
+
+The P1 limitation inherits: on LongMemEval-S the records *are*
+whole sessions truncated to 256 tokens, so TRACE's credit signal is
+only as good as the truncated embeddings that produced the
+retrieval. P2 works at record level and does not fix that — chunked
+or summarised sessions (the P1 follow-up) are still the fix.
+
+### Measured results — merge audit (`scripts/audit_merges.py`)
+
+100 proposals from the synthetic corpus (96 near-duplicate merges +
+4 negatives that must be rejected). Both embedders:
+
+| embedder | proposed | committed | rejected | losses | unexpected |
+|---|---|---|---|---|---|
+| onnx-all-MiniLM-L6-v2 | 100 | 96 | 4 | **0** | 0 |
+| hashed-384 | 100 | 96 | 4 | **0** | 0 |
+
+The 4 rejections are the 4 negatives (unrelated sources → length,
+invented content → faithfulness, mixed types, single source), each
+with the expected reason. Zero losses means every sentence of every
+source survived into its merged record.
+
+### Measured results — LongMemEval-S regression (real, 50Q)
+
+Re-run after P2 with importance off: numbers are **identical** to
+the P1 table (bm25 R@10 1.000, vector 0.860, hybrid 0.980,
+hybrid+mmr 0.860). The schema migration, the live-only filtering,
+and the new columns changed nothing on the standard path.
 
 ## Measured results
 
@@ -154,23 +261,34 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 27 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 42 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
 RRF fusion math, MMR diversity, end-to-end hybrid retrieval, graph
 expansion, the ONNX embedder's paraphrase gap, and the empty-query
 edge case (zero-vector queries return nothing, not the whole store).
+P2 adds: TRACE credit (used vs unused, importance ordering and
+decay, co-recall logging, the importance boost reordering
+retrieval), the merge gate (commit, three rejection reasons,
+rollback, sentence-union drafting), the sleep job (merge + prune +
+co-recall promotion, dry-run writes nothing), and the v1 database
+migration.
 
-## What P2 hooks into
+## What P2 hooks into (P3)
 
-- `Store` — add `importance` / `credit` columns for TRACE-UCB, and a
-  `merges` audit table for judge-gated consolidation. The sleep-phase
-  job calls `store` directly; no retrieval changes needed.
-- `retrieve(..., candidate_ids=...)` — P2's lifecycle needs scoped
-  recall (e.g. "only memories from this project"); the filter is
-  already there.
-- `Retrieved.legs` — P2's credit attribution needs to know which leg
-  surfaced each memory; the set is already returned per record.
-- `eval.py` — the LongMemEval runner is the fixed target P2 must
-  improve on; re-run it after every lifecycle change.
+- `Store` — P3's segment consolidator needs record timestamps and
+  types (both already stored) plus the `merges` audit table, which
+  is the natural home for segment-consolidation records. No new
+  columns are needed for P3.
+- `sleep` — P3's consolidation runs as another offline job beside
+  `sleep`; the merge machinery (`draft_merge_text`,
+  `certificate_for_merge`, `propose_merge`) is reused for
+  consolidating a closed segment into typed records.
+- `importance` / `credit` — P3's query planner (pick vector vs
+  keyword vs temporal route per query) can use per-record
+  importance as a prior for route selection.
+- `eval.py` — the TRACE split runner (`run_synthetic_trace`) is
+  the fixed target P3 must improve on; re-run it after every
+  consolidation change. The LongMemEval-S runner stays the
+  regression check (P2 numbers identical to P1 — see above).

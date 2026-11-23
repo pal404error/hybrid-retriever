@@ -184,6 +184,7 @@ def run_synthetic_trace(
     queries_path: str,
     embedder=None,
     importance_weights: tuple[float, ...] = (0.5, 1.0, 2.0),
+    ucb_c: float = 1.0,
     verbose: bool = True,
 ) -> dict:
     """TRACE eval on the synthetic corpus, with a train/test split.
@@ -247,9 +248,9 @@ def run_synthetic_trace(
         answer = "\n".join(
             store.get_record(g)["text"] for g in sorted(gold)
         )
-        record_use(store, res, answer)
+        record_use(store, res, answer, ucb_c=ucb_c)
     if verbose:
-        print("warm-up done (TRACE credit recorded)")
+        print("warm-up done (TRACE credit recorded, ucb_c=%.2f)" % ucb_c)
     for w in importance_weights:
         scores["hybrid+trace w=%.1f" % w] = score(
             heldout, "hybrid", importance_weight=w
@@ -261,6 +262,7 @@ def run_synthetic_trace(
         "n_warmup": len(warmup),
         "n_records": len(records),
         "embedder": embedder.name,
+        "ucb_c": ucb_c,
         "scores": scores,
     }
 
@@ -272,7 +274,10 @@ def print_report(result: dict) -> None:
         % (result["n_questions"], result["n_records"], result["embedder"])
     )
     if "n_warmup" in result:
-        print("warm-up queries: %d" % result["n_warmup"])
+        print(
+            "warm-up queries: %d   ucb_c: %s"
+            % (result["n_warmup"], result.get("ucb_c", "-"))
+        )
     print(
         "%-22s %6s %6s %8s %10s %12s"
         % ("mode", "P@10", "R@10", "nDCG@10", "any-hit@5", "grounding@10")

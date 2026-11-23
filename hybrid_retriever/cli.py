@@ -56,6 +56,7 @@ def cmd_eval(args) -> None:
             os.path.join("eval_data", "synthetic_corpus.jsonl"),
             os.path.join("eval_data", "synthetic_queries.json"),
             embedder=embedder,
+            ucb_c=args.ucb_c,
         )
         print_report(result)
         return
@@ -178,6 +179,10 @@ def main() -> None:
         action="store_true",
         help="TRACE split eval on the synthetic corpus (warm-up on "
         "keyword queries, eval on paraphrase+trap)",
+    )
+    pe.add_argument(
+        "--ucb-c", type=float, default=1.0,
+        help="TRACE-UCB exploration constant for --trace (default 1.0)",
     )
     pe.set_defaults(func=cmd_eval)
 
