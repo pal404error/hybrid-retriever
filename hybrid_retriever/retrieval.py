@@ -108,11 +108,17 @@ def retrieve(
     reranker=None,
     rerank_n: int = 20,
     candidate_ids: list[int] | None = None,
+    importance_weight: float = 0.0,
 ) -> list[Retrieved]:
     """Run the three legs, fuse with weighted RRF, optionally rerank + MMR.
 
     ``candidate_ids`` restricts all legs to a subset (used by the
     LongMemEval harness, where each question has its own haystack).
+    ``importance_weight`` is the P2 TRACE-UCB hook: when > 0, each
+    fused score is multiplied by ``1 + w * normalised_importance``
+    (min-max over the fused set, so uniform importance changes
+    nothing). w = 0 is exactly P1 behaviour. The boost is applied
+    before rerank/MMR so they see the boosted order.
     Returns at most ``k`` records, best first.
     """
     bm25_ids = [rid for rid, _ in store.bm25_search(query, leg_k, candidate_ids)]
@@ -133,6 +139,25 @@ def retrieve(
     graph_ids = [rid for rid, _ in store.neighbours(seed_ids, leg_k)]
 
     fused = rrf_fuse([bm25_ids, vec_ids, graph_ids], weights, k_rrf)
+    if importance_weight > 0 and fused:
+        imps = store.get_importances([rid for rid, _ in fused])
+        vals = [imps.get(rid, 0.5) for rid, _ in fused]
+        lo, hi = min(vals), max(vals)
+        if hi > lo:
+            fused = [
+                (
+                    rid,
+                    score
+                    * (
+                        1.0
+                        + importance_weight
+                        * (imps.get(rid, 0.5) - lo)
+                        / (hi - lo)
+                    ),
+                )
+                for rid, score in fused
+            ]
+            fused.sort(key=lambda kv: -kv[1])
     leg_map: dict[int, set] = {}
     for leg_name, ids in (
         ("bm25", bm25_ids),

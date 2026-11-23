@@ -27,6 +27,7 @@ import os
 import tempfile
 
 from .embeddings import get_embedder
+from .lifecycle import record_use
 from .retrieval import retrieve
 from .store import Store
 
@@ -142,7 +143,10 @@ def load_synthetic(corpus_path: str, queries_path: str) -> tuple[list[dict], lis
 # ----------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------
-def _retrieve_mode(store, embedder, question, mode, candidate_ids, reranker):
+def _retrieve_mode(
+    store, embedder, question, mode, candidate_ids, reranker,
+    importance_weight: float = 0.0,
+):
     if mode == "bm25":
         res = retrieve(
             store, None, question, k=10, weights=(1.0, 0.0, 0.0),
@@ -157,11 +161,13 @@ def _retrieve_mode(store, embedder, question, mode, candidate_ids, reranker):
         res = retrieve(
             store, embedder, question, k=10, use_mmr=False,
             candidate_ids=candidate_ids,
+            importance_weight=importance_weight,
         )
     elif mode == "hybrid+mmr":
         res = retrieve(
             store, embedder, question, k=10, use_mmr=True,
             candidate_ids=candidate_ids,
+            importance_weight=importance_weight,
         )
     elif mode == "hybrid+rerank":
         res = retrieve(
@@ -171,6 +177,111 @@ def _retrieve_mode(store, embedder, question, mode, candidate_ids, reranker):
     else:
         raise ValueError("unknown mode %r" % mode)
     return [r.id for r in res]
+
+
+def run_synthetic_trace(
+    corpus_path: str,
+    queries_path: str,
+    embedder=None,
+    importance_weights: tuple[float, ...] = (0.5, 1.0, 2.0),
+    verbose: bool = True,
+) -> dict:
+    """TRACE eval on the synthetic corpus, with a train/test split.
+
+    Warm-up on the 48 keyword queries (credit attributed against the
+    gold records' text as the answer proxy — the simulated agent
+    answer grounded in gold evidence), eval on the 48 paraphrase + 8
+    trap queries. The split tests whether credit learned from one
+    phrasing transfers to another phrasing of the same facts.
+    Warming up on the eval queries themselves would be training on
+    the test set, so it is not done. Headline metric: evidence
+    recall@5 = any-hit@5, the MEMOIR paper's metric, vs bare cosine
+    (vector-only) and plain hybrid.
+    """
+    embedder = embedder or get_embedder()
+    records, queries = load_synthetic(corpus_path, queries_path)
+    tmp = tempfile.mkdtemp(prefix="hr-eval-")
+    store = Store(os.path.join(tmp, "eval.db"), embedder=embedder)
+    texts = [r["text"] for r in records]
+    rids = store.add_texts(texts, type_="fact", embedder=embedder)
+    rid_of_key = {r["key"]: rid for r, rid in zip(records, rids)}
+    by_group: dict[str, list[int]] = {}
+    for r, rid in zip(records, rids):
+        by_group.setdefault(r.get("group", ""), []).append(rid)
+    edges = []
+    for group_rids in by_group.values():
+        for a, b in zip(group_rids, group_rids[1:]):
+            edges.append((a, b, 1.0, "related"))
+            edges.append((b, a, 1.0, "related"))
+    store.add_edges(edges)
+    warmup = [q for q in queries if q["kind"] == "keyword"]
+    heldout = [q for q in queries if q["kind"] != "keyword"]
+    if verbose:
+        print(
+            "indexed %d synthetic records (vec_mode=%s); warm-up on %d "
+            "keyword queries, eval on %d paraphrase+trap queries"
+            % (store.count(), store.vec_mode, len(warmup), len(heldout))
+        )
+
+    def score(questions, mode, importance_weight=0.0):
+        metrics = ["P@10", "R@10", "nDCG@10", "any-hit@5", "grounding@10"]
+        per = []
+        for q in questions:
+            gold = {rid_of_key[k] for k in q["gold_keys"] if k in rid_of_key}
+            ranked = _retrieve_mode(
+                store, embedder, q["question"], mode, None, None,
+                importance_weight,
+            )
+            per.append(score_modes({mode: ranked}, gold)[mode])
+        return {
+            m: sum(p[m] for p in per) / len(per) for m in metrics
+        }
+
+    scores = {
+        "vector (bare cosine)": score(heldout, "vector"),
+        "hybrid": score(heldout, "hybrid"),
+    }
+    for q in warmup:
+        gold = {rid_of_key[k] for k in q["gold_keys"] if k in rid_of_key}
+        res = retrieve(store, embedder, q["question"], k=10, use_mmr=False)
+        answer = "\n".join(
+            store.get_record(g)["text"] for g in sorted(gold)
+        )
+        record_use(store, res, answer)
+    if verbose:
+        print("warm-up done (TRACE credit recorded)")
+    for w in importance_weights:
+        scores["hybrid+trace w=%.1f" % w] = score(
+            heldout, "hybrid", importance_weight=w
+        )
+    store.close()
+    return {
+        "corpus": "synthetic (labelled) — TRACE split",
+        "n_questions": len(heldout),
+        "n_warmup": len(warmup),
+        "n_records": len(records),
+        "embedder": embedder.name,
+        "scores": scores,
+    }
+
+
+def print_report(result: dict) -> None:
+    print("\n== %s ==" % result["corpus"])
+    print(
+        "questions: %d   records: %d   embedder: %s"
+        % (result["n_questions"], result["n_records"], result["embedder"])
+    )
+    if "n_warmup" in result:
+        print("warm-up queries: %d" % result["n_warmup"])
+    print(
+        "%-22s %6s %6s %8s %10s %12s"
+        % ("mode", "P@10", "R@10", "nDCG@10", "any-hit@5", "grounding@10")
+    )
+    for mode, m in result["scores"].items():
+        print(
+            "%-22s %6.3f %6.3f %8.3f %10.3f %12.3f"
+            % (mode, m["P@10"], m["R@10"], m["nDCG@10"], m["any-hit@5"], m["grounding@10"])
+        )
 
 
 def run_longmemeval(
@@ -281,20 +392,3 @@ def run_synthetic(
         "embedder": embedder.name,
         "scores": average_scores(per_question),
     }
-
-
-def print_report(result: dict) -> None:
-    print("\n== %s ==" % result["corpus"])
-    print(
-        "questions: %d   records: %d   embedder: %s"
-        % (result["n_questions"], result["n_records"], result["embedder"])
-    )
-    print(
-        "%-14s %6s %6s %8s %10s %12s"
-        % ("mode", "P@10", "R@10", "nDCG@10", "any-hit@5", "grounding@10")
-    )
-    for mode, m in result["scores"].items():
-        print(
-            "%-14s %6.3f %6.3f %8.3f %10.3f %12.3f"
-            % (mode, m["P@10"], m["R@10"], m["nDCG@10"], m["any-hit@5"], m["grounding@10"])
-        )

@@ -18,6 +18,26 @@ edges(src, dst, weight, kind)
   the top BM25 / vector hits, ranked by edge weight. v1 keeps the
   graph as an expander only — it never invents records, it only
   re-surfaces ones linked to a hit.
+
+P2 (MEMOIR-style lifecycle) adds, all on records unless noted:
+  status       'live' | 'superseded' | 'pending' | 'pruned' | 'archived'.
+               Search legs only ever return 'live' records; the other
+               statuses are audit history (superseded originals,
+               pruned dead memories, rolled-back merges).
+  superseded_by  id of the merged record that replaced this one.
+  importance   learned prior, updated by TRACE-UCB (lifecycle.py).
+               Neutral prior 0.5; mean credit + exploration bonus.
+  credit       cumulative credit attributed by record_use.
+  uses         times the record was retrieved for an answer.
+  last_used    timestamp of the last retrieval.
+merges(id, merged_ids, merged_record_id, merged_text, certificate, status, created_at)
+  Audit table for judge-gated consolidation: one row per proposed
+  merge, committed / rejected / rolled-back, with the full
+  sufficiency certificate as JSON.
+co_recall(a, b, count)
+  How often two records were used together for one answer
+  (a < b). The sleep job promotes count >= 2 pairs to 'co-recall'
+  edges; the online path only ever writes this table, never edges.
 """
 
 from __future__ import annotations
@@ -70,6 +90,29 @@ class Store:
         self._vec_dim: int | None = None
         self.vec_mode = self._detect_vec_mode()
         self._init_schema()
+        self._migrate()
+
+    # P2 columns added after v1; existing files are migrated in place.
+    _P2_COLUMNS = {
+        "status": "TEXT NOT NULL DEFAULT 'live'",
+        "superseded_by": "INTEGER",
+        "importance": "REAL NOT NULL DEFAULT 0.5",
+        "credit": "REAL NOT NULL DEFAULT 0.0",
+        "uses": "INTEGER NOT NULL DEFAULT 0",
+        "last_used": "REAL",
+    }
+
+    def _migrate(self) -> None:
+        have = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info(records)")
+        }
+        for name, decl in self._P2_COLUMNS.items():
+            if name not in have:
+                self.conn.execute(
+                    "ALTER TABLE records ADD COLUMN %s %s" % (name, decl)
+                )
+        self.conn.commit()
 
     # -- setup ---------------------------------------------------------
     def _detect_vec_mode(self) -> str:
@@ -91,7 +134,30 @@ class Store:
                  type TEXT NOT NULL DEFAULT 'fact',
                  tags TEXT NOT NULL DEFAULT '[]',
                  created_at REAL NOT NULL,
-                 meta TEXT NOT NULL DEFAULT '{}')"""
+                 meta TEXT NOT NULL DEFAULT '{}',
+                 status TEXT NOT NULL DEFAULT 'live',
+                 superseded_by INTEGER,
+                 importance REAL NOT NULL DEFAULT 0.5,
+                 credit REAL NOT NULL DEFAULT 0.0,
+                 uses INTEGER NOT NULL DEFAULT 0,
+                 last_used REAL)"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS merges(
+                 id INTEGER PRIMARY KEY,
+                 merged_ids TEXT NOT NULL,
+                 merged_record_id INTEGER,
+                 merged_text TEXT NOT NULL DEFAULT '',
+                 certificate TEXT NOT NULL DEFAULT '{}',
+                 status TEXT NOT NULL DEFAULT 'proposed',
+                 created_at REAL NOT NULL)"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS co_recall(
+                 a INTEGER NOT NULL,
+                 b INTEGER NOT NULL,
+                 count INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (a, b))"""
         )
         c.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS records_fts "
@@ -132,16 +198,18 @@ class Store:
         tags: list[str] | None = None,
         meta: dict | None = None,
         embedding: np.ndarray | None = None,
+        status: str = "live",
     ) -> int:
         cur = self.conn.execute(
-            "INSERT INTO records(text, type, tags, created_at, meta) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO records(text, type, tags, created_at, meta, status) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (
                 text,
                 type_,
                 json.dumps(tags or []),
                 time.time(),
                 json.dumps(meta or {}),
+                status,
             ),
         )
         rid = int(cur.lastrowid)
@@ -199,6 +267,192 @@ class Store:
         )
         self.conn.commit()
 
+    # -- P2: lifecycle -------------------------------------------------
+    def non_live_ids(self) -> set[int]:
+        """Ids of records the search legs must never return."""
+        return {
+            int(r[0])
+            for r in self.conn.execute(
+                "SELECT id FROM records WHERE status != 'live'"
+            )
+        }
+
+    def count_live(self) -> int:
+        return int(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM records WHERE status = 'live'"
+            ).fetchone()[0]
+        )
+
+    def set_status(
+        self, rid: int, status: str, superseded_by: int | None = None
+    ) -> None:
+        self.conn.execute(
+            "UPDATE records SET status = ?, superseded_by = ? WHERE id = ?",
+            (status, superseded_by, rid),
+        )
+        self.conn.commit()
+
+    def set_status_many(
+        self, rids: list[int], status: str, superseded_by: int | None = None
+    ) -> None:
+        self.conn.executemany(
+            "UPDATE records SET status = ?, superseded_by = ? WHERE id = ?",
+            [(status, superseded_by, rid) for rid in rids],
+        )
+        self.conn.commit()
+
+    def record_credit_update(
+        self, rid: int, uses: int, credit: float, importance: float
+    ) -> None:
+        self.conn.execute(
+            "UPDATE records SET uses = ?, credit = ?, importance = ?, "
+            "last_used = ? WHERE id = ?",
+            (uses, credit, importance, time.time(), rid),
+        )
+        self.conn.commit()
+
+    def get_importances(self, rids: list[int]) -> dict[int, float]:
+        if not rids:
+            return {}
+        rows = self.conn.execute(
+            "SELECT id, importance FROM records WHERE id IN (%s)"
+            % ",".join("?" * len(rids)),
+            rids,
+        ).fetchall()
+        return {int(r): float(i) for r, i in rows}
+
+    def total_uses(self) -> int:
+        row = self.conn.execute("SELECT COALESCE(SUM(uses), 0) FROM records").fetchone()
+        return int(row[0])
+
+    def log_co_recall(self, a: int, b: int) -> None:
+        if a == b:
+            return
+        lo, hi = (a, b) if a < b else (b, a)
+        self.conn.execute(
+            "INSERT INTO co_recall(a, b, count) VALUES (?, ?, 1) "
+            "ON CONFLICT(a, b) DO UPDATE SET count = count + 1",
+            (lo, hi),
+        )
+        self.conn.commit()
+
+    def co_recall_pairs(self, min_count: int = 2) -> list[tuple[int, int, int]]:
+        return [
+            (int(a), int(b), int(n))
+            for a, b, n in self.conn.execute(
+                "SELECT a, b, count FROM co_recall WHERE count >= ? "
+                "ORDER BY count DESC",
+                (min_count,),
+            ).fetchall()
+        ]
+
+    def list_live_records(
+        self, older_than_days: float | None = None
+    ) -> list[dict]:
+        """Live records, optionally only those older than N days.
+
+        Used by the sleep job's pruning pass.
+        """
+        sql = (
+            "SELECT id, text, type, tags, created_at, meta, status, "
+            "superseded_by, importance, credit, uses, last_used "
+            "FROM records WHERE status = 'live'"
+        )
+        params: list = []
+        if older_than_days is not None:
+            sql += " AND created_at < ?"
+            params.append(time.time() - older_than_days * 86400.0)
+        rows = self.conn.execute(sql, params).fetchall()
+        return [self._row_to_record(r) for r in rows]
+
+    def _row_to_record(self, row) -> dict:
+        return {
+            "id": row[0],
+            "text": row[1],
+            "type": row[2],
+            "tags": json.loads(row[3]),
+            "created_at": row[4],
+            "meta": json.loads(row[5]),
+            "status": row[6],
+            "superseded_by": row[7],
+            "importance": row[8],
+            "credit": row[9],
+            "uses": row[10],
+            "last_used": row[11],
+        }
+
+    def add_merge(
+        self,
+        merged_ids: list[int],
+        merged_record_id: int | None,
+        merged_text: str,
+        certificate: dict,
+        status: str,
+    ) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO merges(merged_ids, merged_record_id, merged_text, "
+            "certificate, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                json.dumps(merged_ids),
+                merged_record_id,
+                merged_text,
+                json.dumps(certificate),
+                status,
+                time.time(),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def get_merge(self, merge_id: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT id, merged_ids, merged_record_id, merged_text, "
+            "certificate, status, created_at FROM merges WHERE id = ?",
+            (merge_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "merged_ids": json.loads(row[1]),
+            "merged_record_id": row[2],
+            "merged_text": row[3],
+            "certificate": json.loads(row[4]),
+            "status": row[5],
+            "created_at": row[6],
+        }
+
+    def list_merges(self, status: str | None = None) -> list[dict]:
+        sql = (
+            "SELECT id, merged_ids, merged_record_id, merged_text, "
+            "certificate, status, created_at FROM merges"
+        )
+        params: list = []
+        if status is not None:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY id"
+        rows = self.conn.execute(sql, params).fetchall()
+        return [
+            {
+                "id": r[0],
+                "merged_ids": json.loads(r[1]),
+                "merged_record_id": r[2],
+                "merged_text": r[3],
+                "certificate": json.loads(r[4]),
+                "status": r[5],
+                "created_at": r[6],
+            }
+            for r in rows
+        ]
+
+    def set_merge_status(self, merge_id: int, status: str) -> None:
+        self.conn.execute(
+            "UPDATE merges SET status = ? WHERE id = ?", (status, merge_id)
+        )
+        self.conn.commit()
+
     # -- reads ---------------------------------------------------------
     def count(self) -> int:
         return int(
@@ -207,20 +461,14 @@ class Store:
 
     def get_record(self, rid: int) -> dict | None:
         row = self.conn.execute(
-            "SELECT id, text, type, tags, created_at, meta FROM records "
-            "WHERE id = ?",
+            "SELECT id, text, type, tags, created_at, meta, status, "
+            "superseded_by, importance, credit, uses, last_used "
+            "FROM records WHERE id = ?",
             (rid,),
         ).fetchone()
         if row is None:
             return None
-        return {
-            "id": row[0],
-            "text": row[1],
-            "type": row[2],
-            "tags": json.loads(row[3]),
-            "created_at": row[4],
-            "meta": json.loads(row[5]),
-        }
+        return self._row_to_record(row)
 
     def fetch(self, rids: list[int]) -> list[dict]:
         return [r for r in (self.get_record(i) for i in rids) if r is not None]
@@ -236,6 +484,10 @@ class Store:
         fts_q = _fts_query(query)
         if fts_q is None:
             return []
+        non_live = self.non_live_ids()
+        # Fetch extra rows when some must be filtered out in Python,
+        # so the caller still gets up to k live hits.
+        limit = k * 5 if non_live else k
         sql = (
             "SELECT rowid, bm25(records_fts) FROM records_fts "
             "WHERE records_fts MATCH ?"
@@ -247,11 +499,14 @@ class Store:
             )
             params.extend(candidate_ids)
         sql += " ORDER BY bm25(records_fts) LIMIT ?"
-        params.append(k)
-        return [
+        params.append(limit)
+        rows = [
             (int(r), float(s))
             for r, s in self.conn.execute(sql, params).fetchall()
         ]
+        if non_live:
+            rows = [x for x in rows if x[0] not in non_live]
+        return rows[:k]
 
     def vector_search(
         self,
@@ -261,10 +516,11 @@ class Store:
     ) -> list[tuple[int, float]]:
         """Cosine similarity, descending. Returns [(record_id, cosine)]."""
         query_vec = np.asarray(query_vec, dtype=np.float32)
+        non_live = self.non_live_ids()
         if self.vec_mode == "sqlite-vec":
             import sqlite_vec
 
-            fetch_k = k * 5 if candidate_ids else k
+            fetch_k = k * 5 if (candidate_ids or non_live) else k
             sql = (
                 "SELECT rowid, vec_distance_cosine(embedding, ?) AS d "
                 "FROM record_vecs ORDER BY d LIMIT ?"
@@ -279,6 +535,8 @@ class Store:
                 for r, d in rows
                 if d is not None and float(d) < 1.0
             ]
+            if non_live:
+                out = [x for x in out if x[0] not in non_live]
             if candidate_ids:
                 allowed = set(candidate_ids)
                 out = [x for x in out if x[0] in allowed][:k]
@@ -293,6 +551,12 @@ class Store:
         mat = np.stack(
             [np.frombuffer(v, dtype=np.float32) for _, v in rows]
         )
+        if non_live:
+            keep = [i for i, rid in enumerate(ids) if rid not in non_live]
+            if not keep:
+                return []
+            ids = [ids[i] for i in keep]
+            mat = mat[keep]
         if candidate_ids:
             allowed = set(candidate_ids)
             keep = [i for i, rid in enumerate(ids) if rid in allowed]
@@ -335,14 +599,18 @@ class Store:
         """
         if not seed_ids:
             return []
+        non_live = self.non_live_ids()
         placeholders = ",".join("?" * len(seed_ids))
         rows = self.conn.execute(
             "SELECT dst, MAX(weight) FROM edges WHERE src IN (%s) "
             "AND dst NOT IN (%s) GROUP BY dst ORDER BY 2 DESC LIMIT ?"
             % (placeholders, placeholders),
-            (*seed_ids, *seed_ids, k),
+            (*seed_ids, *seed_ids, k * 5 if non_live else k),
         ).fetchall()
-        return [(int(r), float(w)) for r, w in rows]
+        out = [(int(r), float(w)) for r, w in rows]
+        if non_live:
+            out = [x for x in out if x[0] not in non_live]
+        return out[:k]
 
     def close(self) -> None:
         self.conn.close()
