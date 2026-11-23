@@ -1,0 +1,938 @@
+[
+  {
+    "question": "who delivers Tom's ingredients",
+    "gold_keys": [
+      "tom-supplier-1",
+      "tom-supplier-2",
+      "tom-supplier-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "what is in Maya's notebook for her rye bread",
+    "gold_keys": [
+      "maya-recipe-1",
+      "maya-recipe-2",
+      "maya-recipe-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Priya compost heap kitchen scraps",
+    "gold_keys": [
+      "priya-compost-1",
+      "priya-compost-2",
+      "priya-compost-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "when does Maya's weekend stall run out of pastries",
+    "gold_keys": [
+      "maya-market-1",
+      "maya-market-2",
+      "maya-market-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Tom knives whetstone Japanese steel",
+    "gold_keys": [
+      "tom-knives-1",
+      "tom-knives-2",
+      "tom-knives-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Omar camera sticky shutter rangefinder",
+    "gold_keys": [
+      "omar-camera-1",
+      "omar-camera-2",
+      "omar-camera-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "What does the cycling club do at the cafe?",
+    "gold_keys": [
+      "dev-route-1",
+      "dev-route-2",
+      "dev-route-3"
+    ],
+    "kind": "trap"
+  },
+  {
+    "question": "Dev road bike chainstay cracked",
+    "gold_keys": [
+      "dev-bike-1",
+      "dev-bike-2",
+      "dev-bike-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Nina marathon personal best Berlin three hours",
+    "gold_keys": [
+      "nina-marathon-1",
+      "nina-marathon-2",
+      "nina-marathon-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Lena classroom reading corner desks",
+    "gold_keys": [
+      "lena-classroom-1",
+      "lena-classroom-2",
+      "lena-classroom-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "where is Lena taking her pupils",
+    "gold_keys": [
+      "lena-trip-1",
+      "lena-trip-2",
+      "lena-trip-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Tom wine list dry white squash soup",
+    "gold_keys": [
+      "tom-wine-1",
+      "tom-wine-2",
+      "tom-wine-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Tom restaurant reservations phone book",
+    "gold_keys": [
+      "tom-reservation-1",
+      "tom-reservation-2",
+      "tom-reservation-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "how does Sam bill for his work",
+    "gold_keys": [
+      "sam-invoice-1",
+      "sam-invoice-2",
+      "sam-invoice-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "what heat does Maya's bread oven reach",
+    "gold_keys": [
+      "maya-oven-1",
+      "maya-oven-2",
+      "maya-oven-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "what plumbing did Sam renew in the old house",
+    "gold_keys": [
+      "sam-pipes-1",
+      "sam-pipes-2",
+      "sam-pipes-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "what does Tom pour with dinner",
+    "gold_keys": [
+      "tom-wine-1",
+      "tom-wine-2",
+      "tom-wine-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "What is in the school garden?",
+    "gold_keys": [
+      "lena-students-1",
+      "lena-students-2",
+      "lena-students-3"
+    ],
+    "kind": "trap"
+  },
+  {
+    "question": "how does Sam locate hidden water damage",
+    "gold_keys": [
+      "sam-leak-1",
+      "sam-leak-2",
+      "sam-leak-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Who fixed the tap in the restaurant kitchen?",
+    "gold_keys": [
+      "sam-leak-1",
+      "sam-leak-2",
+      "sam-leak-3"
+    ],
+    "kind": "trap"
+  },
+  {
+    "question": "Who photographed the garden for the magazine?",
+    "gold_keys": [
+      "omar-shoot-1",
+      "omar-shoot-2",
+      "omar-shoot-3"
+    ],
+    "kind": "trap"
+  },
+  {
+    "question": "when do Lena's pupils get their test marks",
+    "gold_keys": [
+      "lena-exam-1",
+      "lena-exam-2",
+      "lena-exam-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "when does Priya irrigate her plants",
+    "gold_keys": [
+      "priya-watering-1",
+      "priya-watering-2",
+      "priya-watering-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Priya tomatoes heritage variety ripened",
+    "gold_keys": [
+      "priya-tomatoes-1",
+      "priya-tomatoes-2",
+      "priya-tomatoes-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Dev trues wheels spoke key repair",
+    "gold_keys": [
+      "dev-repair-1",
+      "dev-repair-2",
+      "dev-repair-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "what does Lena read to her class",
+    "gold_keys": [
+      "lena-books-1",
+      "lena-books-2",
+      "lena-books-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Priya harvest crates courgettes beans October",
+    "gold_keys": [
+      "priya-harvest-1",
+      "priya-harvest-2",
+      "priya-harvest-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "how does Priya begin her planting season",
+    "gold_keys": [
+      "priya-seeds-1",
+      "priya-seeds-2",
+      "priya-seeds-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Maya stone-milled flour order",
+    "gold_keys": [
+      "maya-flour-1",
+      "maya-flour-2",
+      "maya-flour-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "what did Lena's class do outside school",
+    "gold_keys": [
+      "lena-students-1",
+      "lena-students-2",
+      "lena-students-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "What did Tom bake for the village fete?",
+    "gold_keys": [
+      "tom-dessert-1",
+      "tom-dessert-2",
+      "tom-dessert-3"
+    ],
+    "kind": "trap"
+  },
+  {
+    "question": "how did Dev do in his last cycling competition",
+    "gold_keys": [
+      "dev-race-1",
+      "dev-race-2",
+      "dev-race-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Lena exam papers marked Friday results",
+    "gold_keys": [
+      "lena-exam-1",
+      "lena-exam-2",
+      "lena-exam-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Priya slugs lettuce aphids broad beans pests",
+    "gold_keys": [
+      "priya-pests-1",
+      "priya-pests-2",
+      "priya-pests-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Omar studio north-facing window portraits",
+    "gold_keys": [
+      "omar-studio-1",
+      "omar-studio-2",
+      "omar-studio-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "how is Lena's teaching room arranged",
+    "gold_keys": [
+      "lena-classroom-1",
+      "lena-classroom-2",
+      "lena-classroom-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "what does Nina eat before racing",
+    "gold_keys": [
+      "nina-nutrition-1",
+      "nina-nutrition-2",
+      "nina-nutrition-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Lena field trip museum May farm",
+    "gold_keys": [
+      "lena-trip-1",
+      "lena-trip-2",
+      "lena-trip-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "how does Omar produce his photographs on paper",
+    "gold_keys": [
+      "omar-prints-1",
+      "omar-prints-2",
+      "omar-prints-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "who brings baked goods to the cafes on Maya's route",
+    "gold_keys": [
+      "maya-delivery-1",
+      "maya-delivery-2",
+      "maya-delivery-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Omar dawn shoot harbour fishing boats",
+    "gold_keys": [
+      "omar-shoot-1",
+      "omar-shoot-2",
+      "omar-shoot-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Lena lesson fractions pizza science magnets",
+    "gold_keys": [
+      "lena-lesson-1",
+      "lena-lesson-2",
+      "lena-lesson-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "how does Tom keep his blades sharp",
+    "gold_keys": [
+      "tom-knives-1",
+      "tom-knives-2",
+      "tom-knives-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "what footwear does Nina compete in",
+    "gold_keys": [
+      "nina-shoes-1",
+      "nina-shoes-2",
+      "nina-shoes-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "how do people book a table at Tom's place",
+    "gold_keys": [
+      "tom-reservation-1",
+      "tom-reservation-2",
+      "tom-reservation-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "what does Lena teach with food examples",
+    "gold_keys": [
+      "lena-lesson-1",
+      "lena-lesson-2",
+      "lena-lesson-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "what did Priya gather from her garden",
+    "gold_keys": [
+      "priya-harvest-1",
+      "priya-harvest-2",
+      "priya-harvest-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "what is wrong with Omar's picture-taking device",
+    "gold_keys": [
+      "omar-camera-1",
+      "omar-camera-2",
+      "omar-camera-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "how does Maya maintain her bread culture",
+    "gold_keys": [
+      "maya-starter-1",
+      "maya-starter-2",
+      "maya-starter-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Tom fish supplier five morning vegetables",
+    "gold_keys": [
+      "tom-supplier-1",
+      "tom-supplier-2",
+      "tom-supplier-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Maya deck oven temperature bake",
+    "gold_keys": [
+      "maya-oven-1",
+      "maya-oven-2",
+      "maya-oven-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Nina porridge banana gels nutrition run",
+    "gold_keys": [
+      "nina-nutrition-1",
+      "nina-nutrition-2",
+      "nina-nutrition-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "which way does Dev ride when he trains",
+    "gold_keys": [
+      "dev-route-1",
+      "dev-route-2",
+      "dev-route-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Nina five-minute kilometre pace watch",
+    "gold_keys": [
+      "nina-pace-1",
+      "nina-pace-2",
+      "nina-pace-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Lena books cupboard novels reading level",
+    "gold_keys": [
+      "lena-books-1",
+      "lena-books-2",
+      "lena-books-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Sam pipe wrench cutter press-fit tools",
+    "gold_keys": [
+      "sam-tools-1",
+      "sam-tools-2",
+      "sam-tools-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Priya waters beds dawn drip lines",
+    "gold_keys": [
+      "priya-watering-1",
+      "priya-watering-2",
+      "priya-watering-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "what is Dev's weekly workout schedule",
+    "gold_keys": [
+      "dev-training-1",
+      "dev-training-2",
+      "dev-training-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "what dishes does Tom serve this season",
+    "gold_keys": [
+      "tom-menu-1",
+      "tom-menu-2",
+      "tom-menu-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Omar prints matte cotton paper darkroom",
+    "gold_keys": [
+      "omar-prints-1",
+      "omar-prints-2",
+      "omar-prints-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "when does Sam maintain heating systems",
+    "gold_keys": [
+      "sam-boiler-1",
+      "sam-boiler-2",
+      "sam-boiler-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Tom chocolate dessert lemon tart meringue",
+    "gold_keys": [
+      "tom-dessert-1",
+      "tom-dessert-2",
+      "tom-dessert-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "what is Omar's workspace like",
+    "gold_keys": [
+      "omar-studio-1",
+      "omar-studio-2",
+      "omar-studio-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "what sweet does Tom make best",
+    "gold_keys": [
+      "tom-dessert-1",
+      "tom-dessert-2",
+      "tom-dessert-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "how does Priya recycle garden waste",
+    "gold_keys": [
+      "priya-compost-1",
+      "priya-compost-2",
+      "priya-compost-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Lena students herb garden mayor library",
+    "gold_keys": [
+      "lena-students-1",
+      "lena-students-2",
+      "lena-students-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "what bugs attack Priya's vegetables",
+    "gold_keys": [
+      "priya-pests-1",
+      "priya-pests-2",
+      "priya-pests-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "what kit does Dev take on a long ride",
+    "gold_keys": [
+      "dev-gear-1",
+      "dev-gear-2",
+      "dev-gear-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Sam replaced lead pipes copper cottage",
+    "gold_keys": [
+      "sam-pipes-1",
+      "sam-pipes-2",
+      "sam-pipes-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Sam invoices due fourteen days boiler",
+    "gold_keys": [
+      "sam-invoice-1",
+      "sam-invoice-2",
+      "sam-invoice-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Dev spring criterium twelfth place",
+    "gold_keys": [
+      "dev-race-1",
+      "dev-race-2",
+      "dev-race-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Sam client Oak Road bathroom quote",
+    "gold_keys": [
+      "sam-client-1",
+      "sam-client-2",
+      "sam-client-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Maya market stall cinnamon rolls Saturday",
+    "gold_keys": [
+      "maya-market-1",
+      "maya-market-2",
+      "maya-market-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Tom autumn menu roast squash soup",
+    "gold_keys": [
+      "tom-menu-1",
+      "tom-menu-2",
+      "tom-menu-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "what is Nina's fastest long race time",
+    "gold_keys": [
+      "nina-marathon-1",
+      "nina-marathon-2",
+      "nina-marathon-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Maya walnut loaf recipe hydration",
+    "gold_keys": [
+      "maya-recipe-1",
+      "maya-recipe-2",
+      "maya-recipe-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Nina racing shoes carbon plate kilometres",
+    "gold_keys": [
+      "nina-shoes-1",
+      "nina-shoes-2",
+      "nina-shoes-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "how fast does Nina run",
+    "gold_keys": [
+      "nina-pace-1",
+      "nina-pace-2",
+      "nina-pace-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "where does Maya source her grain for bread",
+    "gold_keys": [
+      "maya-flour-1",
+      "maya-flour-2",
+      "maya-flour-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Priya starts seeds indoors March grow light",
+    "gold_keys": [
+      "priya-seeds-1",
+      "priya-seeds-2",
+      "priya-seeds-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "which glass does Omar prefer for faces",
+    "gold_keys": [
+      "omar-lens-1",
+      "omar-lens-2",
+      "omar-lens-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Omar edits photos evening preset shadows",
+    "gold_keys": [
+      "omar-editing-1",
+      "omar-editing-2",
+      "omar-editing-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Dev training route ridge road reservoir",
+    "gold_keys": [
+      "dev-route-1",
+      "dev-route-2",
+      "dev-route-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Maya croissant delivery cafe",
+    "gold_keys": [
+      "maya-delivery-1",
+      "maya-delivery-2",
+      "maya-delivery-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Sam services boilers autumn warranty",
+    "gold_keys": [
+      "sam-boiler-1",
+      "sam-boiler-2",
+      "sam-boiler-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "where did Omar take pictures at sunrise",
+    "gold_keys": [
+      "omar-shoot-1",
+      "omar-shoot-2",
+      "omar-shoot-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Nina running route lake hill pines",
+    "gold_keys": [
+      "nina-route-1",
+      "nina-route-2",
+      "nina-route-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Maya sourdough starter feeding",
+    "gold_keys": [
+      "maya-starter-1",
+      "maya-starter-2",
+      "maya-starter-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "what equipment does Sam carry on jobs",
+    "gold_keys": [
+      "sam-tools-1",
+      "sam-tools-2",
+      "sam-tools-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "who does Sam do plumbing work for",
+    "gold_keys": [
+      "sam-client-1",
+      "sam-client-2",
+      "sam-client-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Dev rain jacket pump tubes multitool gear",
+    "gold_keys": [
+      "dev-gear-1",
+      "dev-gear-2",
+      "dev-gear-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "when does Omar process his pictures",
+    "gold_keys": [
+      "omar-editing-1",
+      "omar-editing-2",
+      "omar-editing-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "how does Dev fix a wobbly wheel",
+    "gold_keys": [
+      "dev-repair-1",
+      "dev-repair-2",
+      "dev-repair-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "what kind of fruit is Priya growing this year",
+    "gold_keys": [
+      "priya-tomatoes-1",
+      "priya-tomatoes-2",
+      "priya-tomatoes-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "where does Nina go for her runs",
+    "gold_keys": [
+      "nina-route-1",
+      "nina-route-2",
+      "nina-route-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Where does the running club meet on Sundays?",
+    "gold_keys": [
+      "nina-route-1",
+      "nina-route-2",
+      "nina-route-3"
+    ],
+    "kind": "trap"
+  },
+  {
+    "question": "what hurts Nina when she runs",
+    "gold_keys": [
+      "nina-injury-1",
+      "nina-injury-2",
+      "nina-injury-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Omar fifty millimetre lens portraits",
+    "gold_keys": [
+      "omar-lens-1",
+      "omar-lens-2",
+      "omar-lens-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Nina knee injury Achilles rest",
+    "gold_keys": [
+      "nina-injury-1",
+      "nina-injury-2",
+      "nina-injury-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "what is wrong with Dev's bicycle frame",
+    "gold_keys": [
+      "dev-bike-1",
+      "dev-bike-2",
+      "dev-bike-3"
+    ],
+    "kind": "paraphrase"
+  },
+  {
+    "question": "Whose tomatoes grow in the studio window?",
+    "gold_keys": [
+      "priya-tomatoes-1",
+      "priya-tomatoes-2",
+      "priya-tomatoes-3"
+    ],
+    "kind": "trap"
+  },
+  {
+    "question": "Dev trains four mornings intervals Tuesday Thursday",
+    "gold_keys": [
+      "dev-training-1",
+      "dev-training-2",
+      "dev-training-3"
+    ],
+    "kind": "keyword"
+  },
+  {
+    "question": "Who supplies bread to Tom's restaurant?",
+    "gold_keys": [
+      "maya-delivery-1",
+      "maya-delivery-2",
+      "maya-delivery-3"
+    ],
+    "kind": "trap"
+  },
+  {
+    "question": "Sam found leak bath panel ceiling",
+    "gold_keys": [
+      "sam-leak-1",
+      "sam-leak-2",
+      "sam-leak-3"
+    ],
+    "kind": "keyword"
+  }
+]

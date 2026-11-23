@@ -1,0 +1,10 @@
+numpy>=1.26
+sqlite-vec>=0.1.6
+onnxruntime>=1.18
+tokenizers>=0.20
+pytest>=8.0
+
+# Optional: sentence-transformers (torch) gives the same MiniLM model
+# through the reference implementation. Not required — the ONNX path
+# above is the default and needs no torch.
+# sentence-transformers>=3.0

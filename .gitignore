@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+models/
+eval_data/*.json
+eval_data/*_results.txt
+!eval_data/synthetic_corpus.jsonl
+!eval_data/synthetic_queries.json
+.pytest_cache/
