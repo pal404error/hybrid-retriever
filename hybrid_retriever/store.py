@@ -102,6 +102,12 @@ class Store:
         "last_used": "REAL",
     }
 
+    # P19 columns on episodes; existing files are migrated in place.
+    _P19_EPISODE_COLUMNS = {
+        "compressed_text": "TEXT",
+        "compressed_tokens": "INTEGER",
+    }
+
     def _migrate(self) -> None:
         have = {
             row[1]
@@ -111,6 +117,16 @@ class Store:
             if name not in have:
                 self.conn.execute(
                     "ALTER TABLE records ADD COLUMN %s %s" % (name, decl)
+                )
+        ep_have = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info(episodes)")
+        }
+        for name, decl in self._P19_EPISODE_COLUMNS.items():
+            if name not in ep_have:
+                self.conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN %s %s"
+                    % (name, decl)
                 )
         self.conn.commit()
 
@@ -186,6 +202,8 @@ class Store:
                  status TEXT NOT NULL DEFAULT 'live',
                  persisted_by INTEGER,
                  depends_on TEXT NOT NULL DEFAULT '[]',
+                 compressed_text TEXT,
+                 compressed_tokens INTEGER,
                  created_at REAL NOT NULL)"""
         )
         c.execute(
@@ -202,6 +220,25 @@ class Store:
                  tokens_freed INTEGER NOT NULL,
                  budget_tokens INTEGER NOT NULL,
                  total_tokens_before INTEGER NOT NULL,
+                 created_at REAL NOT NULL)"""
+        )
+        # P19 (type-aware compression): one row per compression
+        # applied to an episode — the measurement log for the A/B
+        # harness, next to the evictions table. The compressed
+        # text itself lives on the episode row (compressed_text /
+        # compressed_tokens columns, migrated in _migrate); the
+        # record text is never rewritten.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS compressions(
+                 id INTEGER PRIMARY KEY,
+                 episode_id INTEGER NOT NULL,
+                 session_id TEXT NOT NULL,
+                 type TEXT NOT NULL,
+                 tokens_before INTEGER NOT NULL,
+                 tokens_after INTEGER NOT NULL,
+                 units_before INTEGER NOT NULL,
+                 units_after INTEGER NOT NULL,
+                 latency_ms REAL NOT NULL,
                  created_at REAL NOT NULL)"""
         )
         if self.vec_mode == "numpy":
@@ -530,13 +567,15 @@ class Store:
             "status": row[6],
             "persisted_by": row[7],
             "depends_on": json.loads(row[8]),
-            "created_at": row[9],
+            "compressed_text": row[9],
+            "compressed_tokens": row[10],
+            "created_at": row[11],
         }
 
     def get_episode(self, episode_id: int) -> dict | None:
         row = self.conn.execute(
             "SELECT id, session_id, seq, record_id, type, tokens, "
-            "status, persisted_by, depends_on, created_at FROM episodes "
+            "status, persisted_by, depends_on, compressed_text, compressed_tokens, created_at FROM episodes "
             "WHERE id = ?",
             (episode_id,),
         ).fetchone()
@@ -547,7 +586,7 @@ class Store:
     ) -> list[dict]:
         sql = (
             "SELECT id, session_id, seq, record_id, type, tokens, "
-            "status, persisted_by, depends_on, created_at FROM episodes "
+            "status, persisted_by, depends_on, compressed_text, compressed_tokens, created_at FROM episodes "
             "WHERE session_id = ?"
         )
         params: list = [session_id]
@@ -583,6 +622,100 @@ class Store:
         )
         self.conn.commit()
 
+    # -- P19: compression (context only — records are never rewritten) --
+    def set_episode_compressed(
+        self,
+        episode_id: int,
+        compressed_text: str,
+        compressed_tokens: int,
+    ) -> None:
+        """Store a compressed rendering on the episode and shrink
+        its token count, so the session total reflects what the
+        agent actually sees. The linked record keeps the original
+        text, retrievable on demand."""
+        self.conn.execute(
+            "UPDATE episodes SET compressed_text = ?, "
+            "compressed_tokens = ?, tokens = ? WHERE id = ?",
+            (
+                compressed_text,
+                compressed_tokens,
+                compressed_tokens,
+                episode_id,
+            ),
+        )
+        self.conn.commit()
+
+    def add_compression(
+        self,
+        episode_id: int,
+        session_id: str,
+        type_: str,
+        tokens_before: int,
+        tokens_after: int,
+        units_before: int,
+        units_after: int,
+        latency_ms: float,
+    ) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO compressions(episode_id, session_id, type, "
+            "tokens_before, tokens_after, units_before, units_after, "
+            "latency_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                episode_id,
+                session_id,
+                type_,
+                tokens_before,
+                tokens_after,
+                units_before,
+                units_after,
+                latency_ms,
+                time.time(),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def list_compressions(
+        self, session_id: str | None = None
+    ) -> list[dict]:
+        sql = (
+            "SELECT id, episode_id, session_id, type, tokens_before, "
+            "tokens_after, units_before, units_after, latency_ms, "
+            "created_at FROM compressions"
+        )
+        params: list = []
+        if session_id is not None:
+            sql += " WHERE session_id = ?"
+            params.append(session_id)
+        sql += " ORDER BY id"
+        rows = self.conn.execute(sql, params).fetchall()
+        return [
+            {
+                "id": r[0],
+                "episode_id": r[1],
+                "session_id": r[2],
+                "type": r[3],
+                "tokens_before": r[4],
+                "tokens_after": r[5],
+                "units_before": r[6],
+                "units_after": r[7],
+                "latency_ms": r[8],
+                "created_at": r[9],
+            }
+            for r in rows
+        ]
+
+    def episode_context_text(self, episode_id: int) -> str | None:
+        """The text the agent sees for an episode: its compressed
+        rendering when one exists, else the linked record's text."""
+        ep = self.get_episode(episode_id)
+        if ep is None:
+            return None
+        if ep.get("compressed_text"):
+            return ep["compressed_text"]
+        rec = self.get_record(ep["record_id"])
+        return rec["text"] if rec else None
+
     def episodes_depending_on(
         self, episode_id: int, session_id: str | None = None
     ) -> list[dict]:
@@ -593,7 +726,8 @@ class Store:
             self._row_to_episode(r)
             for r in self.conn.execute(
                 "SELECT id, session_id, seq, record_id, type, tokens, "
-                "status, persisted_by, depends_on, created_at "
+                "status, persisted_by, depends_on, compressed_text, "
+                "compressed_tokens, created_at "
                 "FROM episodes WHERE status = 'live' ORDER BY seq"
             ).fetchall()
         ]

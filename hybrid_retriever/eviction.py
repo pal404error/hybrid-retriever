@@ -321,6 +321,7 @@ def evict_to_budget(
     protect_last: int = DEFAULT_PROTECT_LAST,
     dry_run: bool = False,
     policy: str = "cwl",
+    compress: bool = False,
 ) -> dict:
     """Evict episodes until the session fits ``budget_tokens``.
 
@@ -332,6 +333,16 @@ def evict_to_budget(
     ``dry_run`` (a dry run then reports ``merges_would_commit``-
     style counts as ``would_evict`` so it can never be misread
     as real evictions).
+
+    ``compress=True`` (P19) sits the type-aware compressor
+    inside the loop: when the next victim is a ``tool_result``
+    episode, its output is compressed first and the loop
+    re-evaluates — the episode is evicted only if the session
+    still does not fit after compression. Compression never
+    touches the record (the original stays retrievable); it
+    stores the compressed rendering on the episode and shrinks
+    its token count. Default off, so P18 numbers are identical
+    with ``compress=False``.
     """
     if policy not in ("cwl", "naive"):
         raise ValueError("unknown policy %r" % policy)
@@ -355,6 +366,75 @@ def evict_to_budget(
     )
     evicted: list[dict] = []
     evicted_ids: set[int] = set()
+    compressed: list[dict] = []
+    compressed_ids: set[int] = set()
+    tokens_saved_by_compression = 0
+
+    def _try_compress(victim: dict) -> bool:
+        """Compress one tool_result victim in place.
+
+        Returns True when a real compression was applied (or
+        would be, under dry_run): the episode's tokens shrink
+        and the loop re-evaluates instead of evicting it.
+        Returns False when the text is not compressible — the
+        caller then evicts it as usual.
+        """
+        nonlocal total, tokens_saved_by_compression
+        if victim["type"] != "tool_result":
+            return False
+        if victim["id"] in compressed_ids:
+            return False
+        if victim.get("compressed_text"):
+            # Already compressed in an earlier eviction call.
+            # Compressing again would re-count the same savings
+            # (compress_text measures against the original record
+            # text) and log a phantom compression — the episode
+            # has had its one compression, so it is evictable now.
+            return False
+        record = store.get_record(victim["record_id"])
+        if record is None:
+            return False
+        from .compress import compress_text  # deferred: avoids a cycle
+
+        import time as _time
+
+        start = _time.perf_counter()
+        result = compress_text(record["text"])
+        latency_ms = (_time.perf_counter() - start) * 1000.0
+        if result.tokens_saved <= 0:
+            compressed_ids.add(victim["id"])
+            return False
+        entry = {
+            "episode_id": victim["id"],
+            "type": result.type,
+            "tokens_before": result.tokens_before,
+            "tokens_after": result.tokens_after,
+            "tokens_saved": result.tokens_saved,
+            "units_before": result.units_before,
+            "units_after": result.units_after,
+            "faithfulness": result.faithfulness,
+            "latency_ms": latency_ms,
+        }
+        if not dry_run:
+            store.set_episode_compressed(
+                victim["id"], result.text, result.tokens_after
+            )
+            store.add_compression(
+                victim["id"],
+                session_id,
+                result.type,
+                result.tokens_before,
+                result.tokens_after,
+                result.units_before,
+                result.units_after,
+                latency_ms,
+            )
+        compressed.append(entry)
+        compressed_ids.add(victim["id"])
+        victim["tokens"] = result.tokens_after
+        total -= result.tokens_saved
+        tokens_saved_by_compression += result.tokens_saved
+        return True
 
     def _depended_on(ep_id: int) -> bool:
         # A live episode depends on this one — evicting it would
@@ -391,6 +471,8 @@ def evict_to_budget(
         else:
             candidates.sort(key=lambda e: e["seq"])
         victim = candidates[0]
+        if compress and _try_compress(victim):
+            continue
         tier = eviction_tier(victim) if policy == "cwl" else -1
         reason = (
             eviction_reason(
@@ -438,6 +520,10 @@ def evict_to_budget(
         "n_evicted": len(evicted),
         "evicted_by_tier": by_tier,
         "would_evict": len(evicted) if dry_run else 0,
+        "compressed": compressed,
+        "n_compressed": len(compressed),
+        "tokens_saved_by_compression": tokens_saved_by_compression,
+        "would_compress": len(compressed) if dry_run else 0,
         "under_budget": total <= budget_tokens,
         "overage": max(0, total - budget_tokens),
         "live_episodes": len(live_now),
@@ -483,9 +569,22 @@ def explain_episode(
     rows = store.list_evictions()
     for row in rows:
         if row["episode_id"] == episode_id:
+            compressed_note = ""
+            for c in store.list_compressions():
+                if c["episode_id"] == episode_id:
+                    compressed_note = (
+                        " It had first been compressed (%s, "
+                        "%d -> %d tokens)."
+                        % (
+                            c["type"],
+                            c["tokens_before"],
+                            c["tokens_after"],
+                        )
+                    )
+                    break
             return (
                 "episode #%d (%s, %d tokens) evicted: %s "
-                "(budget %d, session total was %d)"
+                "(budget %d, session total was %d)%s"
                 % (
                     episode_id,
                     ep["type"],
@@ -493,6 +592,7 @@ def explain_episode(
                     row["reason"],
                     row["budget_tokens"],
                     row["total_tokens_before"],
+                    compressed_note,
                 )
             )
     if ep["type"] in NEVER_EVICT_TYPES:
@@ -516,12 +616,27 @@ def explain_episode(
     tier = eviction_tier(ep)
     record = store.get_record(ep["record_id"])
     importance = record["importance"] if record else 0.5
+    compressed_note = ""
+    if ep.get("compressed_text"):
+        before = None
+        for c in store.list_compressions():
+            if c["episode_id"] == episode_id:
+                before = c["tokens_before"]
+                break
+        if before is not None:
+            compressed_note = (
+                " It is compressed (%d tokens instead of the "
+                "original %d); the full output is still in "
+                "record #%d."
+                % (ep["tokens"], before, ep["record_id"])
+            )
     return (
-        "episode #%d (%s) is live and evictable at tier %d: %s"
+        "episode #%d (%s) is live and evictable at tier %d: %s%s"
         % (
             episode_id,
             ep["type"],
             tier,
             eviction_reason(ep, importance),
+            compressed_note,
         )
     )

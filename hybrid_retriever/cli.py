@@ -8,9 +8,11 @@ import os
 
 from .embeddings import get_embedder
 from .eval import (
+    print_compression_report,
     print_eviction_report,
     print_report,
     print_segment_report,
+    run_compression_eval,
     run_eviction_eval,
     run_longmemeval,
     run_segment_eval,
@@ -85,6 +87,16 @@ def cmd_eval(args) -> None:
             budget_frac=args.budget_frac,
         )
         print_eviction_report(result)
+        return
+    if args.compression:
+        result = run_compression_eval(
+            os.path.join("eval_data", "synthetic_corpus.jsonl"),
+            os.path.join("eval_data", "synthetic_queries.json"),
+            embedder=embedder,
+            n_tasks=args.tasks,
+            budget_frac=args.budget_frac,
+        )
+        print_compression_report(result)
         return
     if args.trace:
         result = run_synthetic_trace(
@@ -253,6 +265,7 @@ def cmd_evict(args) -> None:
         protect_last=args.protect_last,
         dry_run=args.dry_run,
         policy=args.policy,
+        compress=args.compress,
     )
     print(
         "evict%s (%s): total %d -> %d tokens (budget %d), "
@@ -269,6 +282,14 @@ def cmd_evict(args) -> None:
             summary["under_budget"],
         )
     )
+    if summary["n_compressed"]:
+        print(
+            "  compressed %d tool_result episodes, %d tokens saved"
+            % (
+                summary["n_compressed"],
+                summary["tokens_saved_by_compression"],
+            )
+        )
     for ev in summary["evicted"]:
         print(
             "  episode #%d %-11s tier %d %d tokens: %s"
@@ -381,6 +402,12 @@ def main() -> None:
         "budget (CWL vs naive vs isolated sessions)",
     )
     pe.add_argument(
+        "--compression",
+        action="store_true",
+        help="P19 compression A/B eval: compress+evict vs "
+        "evict-only on synthetic tool-output tasks",
+    )
+    pe.add_argument(
         "--tasks", type=int, default=40,
         help="tasks in the --eviction demo (default 40)",
     )
@@ -465,6 +492,12 @@ def main() -> None:
     pv.add_argument("--protect-last", type=int, default=3)
     pv.add_argument(
         "--policy", default="cwl", choices=["cwl", "naive"]
+    )
+    pv.add_argument(
+        "--compress",
+        action="store_true",
+        help="P19: compress a tool_result episode's output before "
+        "evicting it (only if the session still does not fit)",
     )
     pv.add_argument("--dry-run", action="store_true")
     pv.set_defaults(func=cmd_evict)

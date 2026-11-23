@@ -44,6 +44,10 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m hybrid_retriever.cli evict --db memory.db --session s1 --budget 2000 [--policy naive] [--dry-run]
 .venv/bin/python -m hybrid_retriever.cli episodes --db memory.db --session s1 [--explain 12]
 .venv/bin/python -m hybrid_retriever.cli eval --eviction   # long session vs naive vs isolated
+
+# P19 type-aware tool-output compression (inside the eviction loop):
+.venv/bin/python -m hybrid_retriever.cli evict --db memory.db --session s1 --budget 2000 --compress
+.venv/bin/python -m hybrid_retriever.cli eval --compression   # compress+evict vs evict-only A/B
 ```
 
 ## Architecture
@@ -103,6 +107,15 @@ query ──┬── BM25 (FTS5) ────────────┐
   every eviction lands in the `evictions` audit table with its
   reason. Tokens are estimated deterministically
   (`ceil(len(text) / 4)`); no LLM, no model, no tokenizer.
+  `evict_to_budget(..., compress=True)` (P19) compresses a
+  `tool_result` victim before evicting it.
+- `hybrid_retriever/compress.py` — P19: type-aware tool-output
+  compressor (`detect_type` / `compress_text` /
+  `verify_no_invention`). JSON / table / log / code / text
+  compressors, extractive-only, no LLM, no model. Compressed
+  text lives on the episode row (`compressed_text` /
+  `compressed_tokens`); the record is never rewritten; every
+  compression lands in the `compressions` audit table.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -525,18 +538,116 @@ and the demo smoke test pins the fixed behaviour.
 - LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
   vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
 
-## What P18 hooks into (P19)
+## P19 — Type-aware tool-output compressor
 
-- `evict_to_budget` runs on any session store, so P19's
-  type-aware compressor can sit *inside* the eviction loop: when
-  the budget is exceeded, compress a tool_result episode's JSON
-  first (P19) and only evict it if it still does not fit.
-- `context_record_ids` is the retrieval surface P19's A/B
-  harness should score against — compressed vs raw recall over
-  the same live context.
-- The `evictions` audit table is the measurement log for P19:
-  tokens freed per eviction vs tokens saved per compression, on
-  the same sessions.
-- `eval.py` — `run_eviction_eval` is the fixed target P19 must
-  not regress: CWL task hit@5 1.000, user-turn recall 1.000,
-  40/40 user turns, 0 dependency violations, at budget 1076.
+`compress.py` implements a minimal, honest Headroom: compress
+tool_result episodes by output type *before* eviction sheds
+them, inside the eviction loop (`evict_to_budget(...,
+compress=True)`; `hr evict --compress`). When the next victim
+is a `tool_result`, its output is compressed first and the loop
+re-evaluates — the episode is evicted only if the session still
+does not fit after compression. Default off, so P18 numbers are
+identical with `compress=False`.
+
+**Compressors, by detected type** (`detect_type`): JSON —
+schema/key pruning (drop null/empty values, collapse
+homogeneous lists to head + tail + a marker naming the shared
+keys and the count, dedupe identical items, truncate long
+strings with a marker); tables — drop all-empty columns,
+dedupe rows, keep head + tail rows with a count marker;
+logs — fold repeated lines (`line (xN)`), keep head + tail;
+Python code — AST pruning (strip docstrings/comments, truncate
+long string literals); text — extractive keep (dedupe
+sentences, keep head + tail). All deterministic, no LLM, no
+model. A compression only counts when it saves ≥10 tokens and
+≥10% of the original; anything smaller is returned unchanged.
+
+**Originals are never touched.** Compression lives on the
+*episode* (the context), never on the *record* (the memory):
+`set_episode_compressed` stores the compressed text beside the
+episode and shrinks its token count; the record keeps the
+original, retrievable on demand (`episode_context_text`). Every
+compression is written to the `compressions` audit table (type,
+tokens before/after, units before/after, latency). An episode
+is compressed at most once — a second encounter evicts it
+instead of re-counting the same savings (a first version
+re-compressed already-compressed episodes and logged phantom
+savings; the regression test pins the fix).
+
+**Faithfulness is checkable by construction.** The compressor
+is extractive-only: output is built from pieces of the original
+plus count markers, nothing is invented. Each compressor
+reports units kept / units seen (JSON leaf paths, table cells,
+distinct log lines, code lines, sentences), and
+`verify_no_invention` proves no line of a compressed output is
+unaccounted for. Turn text carries a `"role: "` prefix;
+detection and compression run on the body, the prefix is
+re-attached.
+
+### Measured results — compression A/B (synthetic, labelled)
+
+40 tasks (20 keyword + 20 paraphrase), 7 turns each, with the 3
+tool_result turns carrying realistic outputs (JSON API response,
+log tail, markdown table) embedding the gold facts; gold
+position rotates per task so it is sometimes in the region the
+compressor keeps and sometimes in the region it collapses.
+64,733 tokens total, budget 21,577 (33%). Reproduce with
+`hr eval --compression`. Embedder: `onnx-all-MiniLM-L6-v2`.
+
+| arm | task hit@5 | user-turn recall | gold survival (end) | gold survival (mean over time) | live tokens | evicted |
+|---|---|---|---|---|---|---|
+| isolated (per task) | — | — | 1.000 | — | — | — |
+| evict (CWL) | 0.350 | 1.000 | 0.317 | 0.681 | 21,292 | 82 |
+| compress (CWL) | 0.350 | 1.000 | 0.317 | 0.682 | 21,514 | 81 |
+
+Compress arm: 82 compressions, **29,514 tokens saved by
+compression** (46% of the session total, ~360 per
+compression), 1 eviction avoided (82 → 81), faithfulness
+**0.486** (units kept / units seen), **0 no-invention
+violations**, latency mean 0.79 ms / p95 0.62 ms per call
+(a few slow outliers pull the mean above p95). Both arms under
+budget, 0 dependency violations.
+
+The honest reading: the per-episode savings are large and
+real, but the end-state benefit in this setup is ~zero — 1
+fewer eviction, identical end survival, identical task hit@5,
+and mean-over-time survival 0.682 vs 0.681 (noise). The session
+grows monotonically and the budget is a cap, so compression
+delays eviction by about one task rather than preventing it: a
+compressed episode survives one more eviction round, then gets
+evicted as the oldest tier-0 victim in the next round, and the
+saved tokens are absorbed by the next task's growth. The
+faithfulness price is also real: the compressor keeps about
+half the countable units, dominated by JSON list collapse (12
+items → head + tail + marker). And task hit@5 is 0.350 in *both*
+long arms vs 1.000 in the P18 demo — not a compression
+regression (both arms are equal), but a property of this
+workload: P3 consolidation merges the long tool outputs into
+segment records too long for the 256-token embedding window,
+so retrieval dilutes. Compression is a token lever, not a
+recall lever, on this workload — publish the harness, not the
+headline (the same lesson as Headroom's 21–57% claim vs the
+independent ~2% test).
+
+### Regressions (re-run after P19)
+
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+
+## What P19 hooks into (P20/P21)
+
+- `run_compression_eval` is the A/B harness P20's
+  verify-by-doing evaluator and P21's mini-TOBench can reuse:
+  fixed task set, four measured metrics, no LLM in the loop.
+- The `compressions` audit table is the measurement log for
+  any future policy that compresses before evicting (e.g. a
+  per-type budget, or compressing `reasoning` episodes too —
+  currently only `tool_result` is compressed).

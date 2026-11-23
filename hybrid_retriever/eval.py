@@ -1086,3 +1086,500 @@ def print_eviction_report(result: dict) -> None:
                 m.get("under_budget", "-"),
             )
         )
+
+
+# ----------------------------------------------------------------------
+# P19 — compression A/B harness
+# ----------------------------------------------------------------------
+def _compression_task_turns(
+    question: str, gold_texts: list[str], task_idx: int
+) -> list[dict]:
+    """One task as 7 annotated turns, like ``_eviction_task_turns``,
+    but the 3 tool_result turns carry realistic tool outputs
+    (JSON API response, log tail, markdown table) with the gold
+    facts embedded in them.
+
+    The gold fact's position inside each output rotates with the
+    task index (``task_idx % size``), so the gold is sometimes in
+    the region the compressor keeps (head/tail) and sometimes in
+    the region it collapses (middle). That is deliberate: the
+    survival metric must measure what compression actually
+    keeps, not a best case where the gold is always first.
+    """
+    turns = [
+        {"role": "user", "text": question},
+        {
+            "role": "assistant",
+            "text": "Let me look up the records for this question.",
+        },
+        {
+            "role": "assistant",
+            "text": "lookup records",
+            "episode_type": "tool_call",
+        },
+    ]
+    # JSON: a homogeneous list of 12 items; the gold is one note.
+    items = [
+        {
+            "id": i,
+            "note": "unrelated entry %d about topic %d" % (i, i % 5),
+            "score": round(0.1 * i, 1),
+            "detail": "x" * 200,
+        }
+        for i in range(12)
+    ]
+    gold_pos = task_idx % 12
+    items[gold_pos]["note"] = gold_texts[0] if gold_texts else "no gold"
+    items.append(dict(items[3]))  # exact duplicate, for dedup
+    turns.append(
+        {
+            "role": "tool",
+            "text": json.dumps(
+                {
+                    "status": "ok",
+                    "count": len(items),
+                    "results": items,
+                    "empty": None,
+                }
+            ),
+        }
+    )
+    # Log: 30 distinct lines + 5 repeated heartbeats + 1 error;
+    # the gold is one line's message.
+    log_lines = []
+    for i in range(30):
+        msg = "fetched record %d from shard %d" % (i, i % 4)
+        if i == task_idx % 30 and len(gold_texts) > 1:
+            msg = gold_texts[1]
+        log_lines.append(
+            "2026-11-24T10:%02d:00Z INFO %s" % (i % 60, msg)
+        )
+    for _ in range(5):
+        log_lines.append("2026-11-24T10:00:00Z INFO heartbeat ok")
+    log_lines.append("2026-11-24T10:00:00Z ERROR timeout on shard 7")
+    turns.append({"role": "tool", "text": "\n".join(log_lines)})
+    # Table: 15 rows; the gold is one row's note.
+    rows = ["| id | note | score |", "|---|---|---|"]
+    for i in range(15):
+        note = "unrelated entry %d" % i
+        if i == task_idx % 15 and len(gold_texts) > 2:
+            note = gold_texts[2]
+        rows.append("| %d | %s | %.1f |" % (i, note, 0.1 * i))
+    rows.append("| 3 | unrelated entry 3 | 0.3 |")  # duplicate row
+    turns.append({"role": "tool", "text": "\n".join(rows)})
+    turns.append(
+        {"role": "assistant", "text": "Noted.", "episode_type": "chatter"}
+    )
+    return turns
+
+
+def _norm_text(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _gold_survival_context(store: Store, session: str, gold_texts) -> float:
+    """Fraction of gold facts present in the live context text.
+
+    The context is what the agent actually sees: live episodes'
+    effective text (compressed when compressed, original when
+    not). Consolidated segment records are deliberately excluded
+    — they preserve facts by design (P18's finding), and this
+    metric is about what compression + eviction leave in the
+    context itself.
+    """
+    if not gold_texts:
+        return 1.0
+    context = []
+    for ep in store.list_episodes(session, status="live"):
+        text = store.episode_context_text(ep["id"])
+        if text:
+            context.append(text)
+    blob = _norm_text("\n".join(context))
+    hits = sum(
+        1 for g in gold_texts if _norm_text(g) in blob
+    )
+    return hits / len(gold_texts)
+
+
+def run_compression_eval(
+    corpus_path: str,
+    queries_path: str,
+    embedder=None,
+    n_tasks: int = 40,
+    budget_frac: float = 1.0 / 3.0,
+    verbose: bool = True,
+) -> dict:
+    """P19 eval: compress+evict vs evict-only, same budget.
+
+    Same task set, budget and consolidation as
+    ``run_eviction_eval``; the only difference is the tool
+    outputs (JSON / log / table, via ``_compression_task_turns``)
+    and the arms: ``evict`` (CWL, compress off) vs ``compress``
+    (CWL, compress on), plus ``isolated`` (no budget) as the
+    ceiling. Four metrics, all measured on this run:
+
+    * tokens saved — tokens the compressor removed, and
+      evictions avoided vs the evict-only arm;
+    * recall preserved — gold survival in the live context text,
+      plus the P18 retrieval scores (task hit@5, user-turn
+      recall) as the regression check;
+    * faithfulness — units kept / units seen over the
+      compression audit rows, plus a no-invention violation
+      count (every compressed line checked against its
+      original);
+    * latency — ms per compression call, from the audit rows.
+    """
+    from .compress import verify_no_invention
+    from .eviction import (
+        dependency_violations,
+        estimate_tokens,
+        evict_to_budget,
+        ingest_session,
+        mark_session_persisted_by_merges,
+    )
+    from .lifecycle import draft_merge_text, propose_merge
+    from .segments import classify_segment
+
+    embedder = embedder or get_embedder()
+    records, queries = load_synthetic(corpus_path, queries_path)
+    by_key = {r["key"]: r for r in records}
+    tasks = []
+    seen_gold: set[tuple[str, ...]] = set()
+    pool = [q for q in queries if q["kind"] == "keyword"] + [
+        q for q in queries if q["kind"] == "paraphrase"
+    ]
+    for q in pool:
+        key = tuple(sorted(q["gold_keys"]))
+        if key in seen_gold:
+            continue
+        seen_gold.add(key)
+        tasks.append(q)
+        if len(tasks) >= n_tasks:
+            break
+    for q in tasks:
+        q["_gold_texts"] = [
+            by_key[k]["text"] for k in q["gold_keys"] if k in by_key
+        ]
+    total_tokens = sum(
+        estimate_tokens(t["text"])
+        for qi, q in enumerate(tasks)
+        for t in _compression_task_turns(
+            q["question"], q["_gold_texts"], qi
+        )
+    )
+    budget = max(1, int(total_tokens * budget_frac))
+    if verbose:
+        print(
+            "compression eval: %d tasks, %d turns, %d tokens "
+            "total, budget %d (%.0f%%)"
+            % (
+                len(tasks),
+                len(tasks) * 7,
+                total_tokens,
+                budget,
+                budget_frac * 100,
+            )
+        )
+
+    def _consolidate_task(store, episode_ids):
+        eps = [store.get_episode(e) for e in episode_ids]
+        srcs = [
+            e for e in eps if e is not None and e["type"] != "user"
+        ]
+        if len(srcs) < 2:
+            return None
+        ids = [e["record_id"] for e in srcs]
+        texts = [store.get_record(i)["text"] for i in ids]
+        union = draft_merge_text(texts)
+        res = propose_merge(
+            store,
+            embedder,
+            ids,
+            merged_text=union,
+            type_override=classify_segment(union),
+            max_length_ratio=1.0,
+        )
+        return res.merged_record_id
+
+    def _score(store, question, gold, candidates):
+        if not candidates:
+            return 0.0
+        ranked = [
+            r.id
+            for r in retrieve(
+                store, embedder, question, k=10, use_mmr=False,
+                candidate_ids=candidates,
+            )
+        ]
+        return any_hit_at_k(ranked, gold, 5)
+
+    def _run_long(compress: bool):
+        tmp = tempfile.mkdtemp(prefix="hr-compress-")
+        store = Store(os.path.join(tmp, "eval.db"), embedder=embedder)
+        session = "long-compress" if compress else "long-evict"
+        ev_summaries = []
+        task_gold_rids: list[set[int]] = []
+        task_user_rids: list[int] = []
+        task_gold_texts: list[list[str]] = []
+        # Gold survival sampled after EVERY task's eviction, over
+        # the gold introduced so far: the end-of-session number
+        # alone washes compression out (both arms end at the
+        # budget cap holding the newest episodes), while the
+        # time-averaged number shows what the agent could still
+        # see while the session was running.
+        survival_samples: list[float] = []
+        for qi, q in enumerate(tasks):
+            turns = _compression_task_turns(
+                q["question"], q["_gold_texts"], qi
+            )
+            ep_ids = ingest_session(store, session, turns)
+            gold: set[int] = set()
+            user_rid: int | None = None
+            for eid in ep_ids:
+                ep = store.get_episode(eid)
+                if ep["type"] == "tool_result":
+                    gold.add(ep["record_id"])
+                elif ep["type"] == "user":
+                    user_rid = ep["record_id"]
+            task_gold_rids.append(gold)
+            task_user_rids.append(user_rid)
+            task_gold_texts.append(q["_gold_texts"])
+            _consolidate_task(store, ep_ids)
+            mark_session_persisted_by_merges(store, session)
+            ev_summaries.append(
+                evict_to_budget(
+                    store, session, budget, compress=compress
+                )
+            )
+            survival_samples.append(
+                _gold_survival_context(
+                    store,
+                    session,
+                    [
+                        g
+                        for texts in task_gold_texts
+                        for g in texts
+                    ],
+                )
+            )
+        seg_of_turn: dict[int, int] = {}
+        for m in store.list_merges(status="committed"):
+            for src in m["merged_ids"]:
+                seg_of_turn[src] = m["merged_record_id"]
+        task_scores: list[float] = []
+        recall_scores: list[float] = []
+        live_ep_recs = [
+            e["record_id"]
+            for e in store.list_episodes(session, status="live")
+        ]
+        for q, gold_rids, user_rid in zip(
+            tasks, task_gold_rids, task_user_rids
+        ):
+            gold = {seg_of_turn.get(r, r) for r in gold_rids}
+            task_scores.append(
+                _score(
+                    store,
+                    q["question"],
+                    gold,
+                    store.context_record_ids(session),
+                )
+            )
+            if user_rid is not None:
+                recall_scores.append(
+                    _score(
+                        store,
+                        q["question"],
+                        {user_rid},
+                        live_ep_recs,
+                    )
+                )
+        survival = sum(
+            _gold_survival_context(store, session, texts)
+            for texts in task_gold_texts
+        ) / max(1, len(task_gold_texts))
+        # Faithfulness + latency from the compression audit rows.
+        comp_rows = store.list_compressions(session_id=session)
+        units_before = sum(r["units_before"] for r in comp_rows)
+        units_after = sum(r["units_after"] for r in comp_rows)
+        latencies = sorted(r["latency_ms"] for r in comp_rows)
+        violations = 0
+        for r in comp_rows:
+            ep = store.get_episode(r["episode_id"])
+            rec = store.get_record(ep["record_id"]) if ep else None
+            if ep is None or rec is None:
+                continue
+            # Eviction never clears compressed_text, so even an
+            # episode evicted after compression still carries its
+            # compressed rendering for this check.
+            compressed = ep.get("compressed_text")
+            if compressed and verify_no_invention(
+                rec["text"], compressed
+            ):
+                violations += 1
+        live = store.list_episodes(session, status="live")
+        user_live = sum(1 for e in live if e["type"] == "user")
+        last = ev_summaries[-1] if ev_summaries else {}
+        result = {
+            "task_any_hit5": (
+                sum(task_scores) / len(task_scores) if task_scores else 0.0
+            ),
+            "user_turn_recall": (
+                sum(recall_scores) / len(recall_scores)
+                if recall_scores
+                else 0.0
+            ),
+            "user_turns_live": user_live,
+            "user_turns_total": len(tasks),
+            "live_tokens": store.session_token_total(session),
+            "total_tokens": total_tokens,
+            "budget": budget,
+            "evicted_total": sum(
+                s.get("n_evicted", 0) for s in ev_summaries
+            ),
+            "compressed_total": sum(
+                s.get("n_compressed", 0) for s in ev_summaries
+            ),
+            "tokens_saved_by_compression": sum(
+                s.get("tokens_saved_by_compression", 0)
+                for s in ev_summaries
+            ),
+            "gold_survival_context": survival,
+            "gold_survival_mean_over_time": (
+                sum(survival_samples) / len(survival_samples)
+                if survival_samples
+                else 1.0
+            ),
+            "faithfulness": (
+                units_after / units_before if units_before else 1.0
+            ),
+            "no_invention_violations": violations,
+            "compression_calls": len(comp_rows),
+            "latency_ms_mean": (
+                sum(latencies) / len(latencies) if latencies else 0.0
+            ),
+            "latency_ms_p95": (
+                latencies[int(0.95 * (len(latencies) - 1))]
+                if latencies
+                else 0.0
+            ),
+            "dependency_violations": len(
+                dependency_violations(store, session)
+            ),
+            "under_budget": bool(last.get("under_budget", True)),
+        }
+        store.close()
+        return result
+
+    def _run_isolated():
+        survival = 0.0
+        for qi, q in enumerate(tasks):
+            tmp = tempfile.mkdtemp(prefix="hr-iso-c-")
+            store = Store(
+                os.path.join(tmp, "eval.db"), embedder=embedder
+            )
+            session = "isolated"
+            turns = _compression_task_turns(
+                q["question"], q["_gold_texts"], qi
+            )
+            ingest_session(store, session, turns)
+            survival += _gold_survival_context(
+                store, session, q["_gold_texts"]
+            )
+            store.close()
+        return {
+            "gold_survival_context": (
+                survival / len(tasks) if tasks else 1.0
+            ),
+        }
+
+    arms = {
+        "isolated": _run_isolated(),
+        "evict": _run_long(compress=False),
+        "compress": _run_long(compress=True),
+    }
+    return {
+        "corpus": "synthetic tool-output tasks (labelled)",
+        "n_tasks": len(tasks),
+        "total_tokens": total_tokens,
+        "budget": budget,
+        "budget_frac": budget_frac,
+        "embedder": embedder.name,
+        "arms": arms,
+    }
+
+
+def print_compression_report(result: dict) -> None:
+    print("\n== %s ==" % result["corpus"])
+    print(
+        "tasks: %d   total tokens: %d   budget: %d (%.0f%%)   "
+        "embedder: %s"
+        % (
+            result["n_tasks"],
+            result["total_tokens"],
+            result["budget"],
+            result["budget_frac"] * 100,
+            result["embedder"],
+        )
+    )
+    print(
+        "%-10s %12s %16s %14s %12s %12s"
+        % (
+            "arm",
+            "task hit@5",
+            "user-turn rec.",
+            "gold survival",
+            "live toks",
+            "evicted",
+        )
+    )
+    for arm, m in result["arms"].items():
+        print(
+            "%-10s %12.3f %16s %14.3f %12s %12s"
+            % (
+                arm,
+                m.get("task_any_hit5", float("nan")),
+                ("%.3f" % m["user_turn_recall"])
+                if "user_turn_recall" in m
+                else "-",
+                m["gold_survival_context"],
+                str(m.get("live_tokens", "-")),
+                str(m.get("evicted_total", "-")),
+            )
+        )
+    c = result["arms"]["compress"]
+    e = result["arms"]["evict"]
+    print(
+        "gold survival, mean over time (sampled after each "
+        "task): evict %.3f, compress %.3f"
+        % (
+            e["gold_survival_mean_over_time"],
+            c["gold_survival_mean_over_time"],
+        )
+    )
+    print(
+        "compress: %d compressions, %d tokens saved by "
+        "compression, %d evictions avoided vs evict-only "
+        "(%d -> %d), faithfulness %.3f, no-invention "
+        "violations %d, latency mean %.2f ms / p95 %.2f ms"
+        % (
+            c["compressed_total"],
+            c["tokens_saved_by_compression"],
+            e["evicted_total"] - c["evicted_total"],
+            e["evicted_total"],
+            c["evicted_total"],
+            c["faithfulness"],
+            c["no_invention_violations"],
+            c["latency_ms_mean"],
+            c["latency_ms_p95"],
+        )
+    )
+    print(
+        "under budget: evict %s, compress %s; dependency "
+        "violations: evict %s, compress %s"
+        % (
+            e["under_budget"],
+            c["under_budget"],
+            e["dependency_violations"],
+            c["dependency_violations"],
+        )
+    )
