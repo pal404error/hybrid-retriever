@@ -344,6 +344,13 @@ def cmd_episodes(args) -> None:
     store.close()
 
 
+def cmd_durable(args) -> None:
+    """P22: forward to hybrid_retriever.durable's own CLI."""
+    from .durable import main as durable_main
+
+    raise SystemExit(durable_main(args.durable_args))
+
+
 def cmd_merges(args) -> None:
     store = Store(args.db)
     for m in store.list_merges(status=args.status):
@@ -547,6 +554,17 @@ def main() -> None:
                      help="filter: live, evicted")
     pe2.add_argument("--explain", type=int, default=None)
     pe2.set_defaults(func=cmd_episodes)
+
+    pd = sub.add_parser(
+        "durable",
+        help="P22: durable agent loop on DBOS (run/recover/approve/"
+        "status/demo/approval-demo)",
+    )
+    pd.add_argument(
+        "durable_args", nargs=argparse.REMAINDER,
+        help="arguments forwarded to hybrid_retriever.durable",
+    )
+    pd.set_defaults(func=cmd_durable)
 
     args = p.parse_args()
     args.func(args)

@@ -3,6 +3,7 @@ sqlite-vec>=0.1.6
 onnxruntime>=1.18
 tokenizers>=0.20
 pytest>=8.0
+dbos[aiosqlite]==3.6.0
 
 # Optional: sentence-transformers (torch) gives the same MiniLM model
 # through the reference implementation. Not required — the ONNX path

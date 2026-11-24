@@ -872,3 +872,139 @@ do not compare the 1.000 to either number.
 - P20's adoption gate gains a second consumer: a rule memory
   whose lift the VbD harness measured can be scored here too,
   as the policy the agent follows when the memory is recalled.
+
+## P22 — Durable agent loop on real DBOS (SQLite system DB)
+
+DBOS (the durable-execution library: annotate a workflow and its
+steps, and a crash mid-run resumes from the journal instead of
+restarting) wraps the P21 grounded policy in
+`hybrid_retriever/durable.py`: one DBOS step per tool call, each
+step's output checkpointed in the system database, and a fresh
+process auto-recovers the PENDING workflow on launch. The
+human-approval gate is a file flag (`approval.txt`) polled with
+durable `DBOS.sleep` — completed sleeps are skipped on recovery,
+so the pause survives a restart.
+
+Substitutions, stated plainly: there is no Postgres on this VM
+(no server, no docker, no psql), and DBOS 3.6.0's DEFAULT system
+database is SQLite (`system_database_url` defaults to
+`sqlite:///{name}`), so this runs REAL DBOS — same
+`@DBOS.workflow` / `@DBOS.step` decorators, same journal tables
+(`workflow_status`, `operation_outputs`), same recovery path —
+with the system database in a SQLite file instead of Postgres.
+That is the configuration DBOS itself ships as the default, not
+a reimplementation; Postgres is the production default and the
+only change needed to move there is the URL. There is no LLM:
+the loop's work is the deterministic P21 grounded policy,
+decomposed into one step per tool call. Steps carry an
+artificial `step_delay` (default 0) before their side effect,
+ONLY so the kill demo/tests can land the SIGKILL mid-run on a
+workload whose real work takes milliseconds.
+
+The guarantee is not "DBOS makes it exactly-once" — it does
+not. DBOS steps are at-least-once: a step killed after its side
+effect but before its output is checkpointed re-executes on
+recovery (verified in the smoke test — a step killed mid-write
+ran twice in the raw log). So every step body here is
+IDEMPOTENT — remember/create/complete check before they act,
+file writes overwrite — and the seed step is idempotent too
+(it reuses the same check-then-act helpers, plus a `seed.json`
+marker). The durable trace (`trace.jsonl`, one line per executed
+step keyed by DBOS step id) dedupes by step id on rebuild, so a
+re-executed step leaves exactly one trace entry. The
+no-duplicated-side-effects claim is proved by the demo's
+assertions (live-record counts, tracker state, trace step ids,
+artifact bytes vs a plain P21 grounded run), not assumed from
+the engine.
+
+### Measured results — kill and resume (D1, real run)
+
+`hr durable demo --task D1 --step-delay 1.0 --kill-after-steps 2`
+(SIGKILL after 2 trace lines, fresh process recovers):
+
+- At kill: workflow PENDING, 2 trace lines (recall + deliverable
+  write) with 2–3 steps checkpointed in `operation_outputs` —
+  the exact count depends on where the kill lands relative to
+  the in-flight step's return: a step killed after appending
+  its trace line but before returning re-executes on recovery
+  (idempotent overwrite, trace line deduped by step id).
+- Recovery log: `Recovering 1 workflows from application version
+  142dddcb1b63f114356bda847a897d46`, then `STATUS: SUCCESS`,
+  `RESULT: {'task_id': 'D1', 'result': 'release 1.4 ships
+  semantic recall\nrelease 1.4 fixes the torn-tail bug'}`.
+- P21 verifier on the rebuilt bundle (store + durable trace):
+  all checks pass. Exactly-once assertions: zero violations —
+  each seeded memory live exactly once, the tracker task
+  completed exactly once, the rebuilt trace holds one event per
+  distinct step id, and both artifacts are byte-identical to a
+  plain P21 grounded run of the same task.
+
+### Measured results — approval pause survives a restart (D1)
+
+`hr durable approval-demo --task D1`: the run writes the
+deliverable, pauses at the gate (tracker task still open), is
+SIGKILLed mid-pause, and a fresh DBOS instance recovers it —
+still PENDING, tracker still open after several sleep cycles —
+then the operator creates `approval.txt` and the run completes
+with `STATUS: SUCCESS`, verifier passing, zero violations.
+
+### Regressions (re-run after P22)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 82 compressions, 29,514 tokens
+  saved, faithfulness 0.486, 0 violations). Latency this run
+  1.74 ms mean vs the README's 0.79 ms — load-dependent, same
+  as P20/P21 noted; the functional numbers are identical.
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+
+### The honest reading
+
+What resume guarantees here: a workflow killed after at least
+one step output is checkpointed resumes from the journal in a
+fresh process, completed steps are not re-executed, and the
+side effects of the run happen exactly once — because the step
+bodies are idempotent, not because the engine promises it.
+What it does not guarantee: a step that is not idempotent
+duplicates its side effect when it re-executes in the crash
+window (the smoke test caught this: a step killed after its
+write but before its checkpoint ran twice); a side effect
+performed outside a step — in the workflow body, or by an
+external process — is invisible to the journal and is neither
+replayed nor deduped; a crash inside a step's own write (e.g.
+half a file flushed) leaves the partial write, and only the
+step's idempotency (overwrite, check-then-act) repairs it on
+re-execution; and a kill before the first step output is
+checkpointed leaves the workflow ENQUEUED, which
+`recover_workflows` does not pick up (it only recovers
+PENDING) — the run is orphaned with zero side effects, which
+the test suite pins as the observed edge, not a success. The
+approval gate's `DBOS.sleep` loop records one sleep operation
+per poll cycle, so a pause of hours would bloat the journal;
+for that, DBOS `recv`/`send` events are the right primitive
+and the file flag is the demo's inspectable stand-in. None of
+this is a reason to hand-roll a journal instead: the 2026
+consensus in the plan (use the engine, don't build your own
+retry/checkpoint logic) held — the engine did the hard part
+(checkpointing, recovery, sleep replay) and the application
+did the small part (idempotent steps).
+
+## What P22 hooks into (P23)
+
+- P23's GEPA-style loop is the first consumer that needs this:
+  a nightly diagnoser that proposes an edit, A/B-tests it, and
+  keeps it only if it wins must survive a crash mid-A/B without
+  double-counting a task or losing the verdict — that is a
+  durable workflow over the P21 harness, and this module is the
+  pattern for it.
+- Any agent loop built on the P21 servers (memory/files/tracker)
+  can be wrapped the same way: one step per tool call, idempotent
+  step bodies, the durable trace for verification.
