@@ -114,6 +114,40 @@ def cmd_eval(args) -> None:
         result = run_tobench_eval(n_tasks=args.tasks)
         print_tobench_report(result)
         return
+    if args.gepa:
+        from .gepa import print_gepa_report, run_gepa_demo, run_nightly, TraceStore
+        import os as _os
+        import tempfile as _tempfile
+
+        if args.skill is None and args.traces is None:
+            result = run_gepa_demo(nights=args.nights)
+            print_gepa_report(result)
+            return
+        skill_path = args.skill or _os.path.join("skills", "tobench-agent", "SKILL.md")
+        traces_path = args.traces or _os.path.join(
+            _os.path.dirname(_os.path.abspath(skill_path)), "traces.db"
+        )
+        if not _os.path.exists(skill_path):
+            from .gepa import render_skill
+
+            _os.makedirs(_os.path.dirname(_os.path.abspath(skill_path)), exist_ok=True)
+            with open(skill_path, "w", encoding="utf-8") as fh:
+                fh.write(render_skill([]))
+        store = TraceStore(traces_path)
+        for night in range(args.nights):
+            report = run_nightly(store, skill_path)
+            print(
+                "night %d: eval %d/%d, proposal %s -> %s"
+                % (
+                    night + 1,
+                    report["eval_passed"],
+                    report["eval_total"],
+                    (report["proposal"] or {}).get("rule_id"),
+                    report["verdict"],
+                )
+            )
+        store.close()
+        return
     if args.trace:
         result = run_synthetic_trace(
             os.path.join("eval_data", "synthetic_corpus.jsonl"),
@@ -443,6 +477,27 @@ def main() -> None:
         help="P21 mini-TOBench eval: two deterministic agent policies "
         "on 12 tool-use tasks over the memory/files/tracker servers "
         "(no embedder needed)",
+    )
+    pe.add_argument(
+        "--gepa",
+        action="store_true",
+        help="P23 GEPA-style loop: N nights of trace -> diagnose -> "
+        "propose one skill edit -> A/B on the fixed P21 set, keep "
+        "only if it wins (no --skill/--traces runs the temp-dir "
+        "demo incl. the planted bad-edit trial)",
+    )
+    pe.add_argument(
+        "--nights", type=int, default=4,
+        help="nights for --gepa (default 4)",
+    )
+    pe.add_argument(
+        "--skill", default=None,
+        help="SKILL.md path for --gepa (default: temp-dir demo skill)",
+    )
+    pe.add_argument(
+        "--traces", default=None,
+        help="trace-store SQLite path for --gepa "
+        "(default: temp-dir demo store)",
     )
     pe.add_argument(
         "--k", type=int, default=5,

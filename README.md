@@ -304,7 +304,7 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 79 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 162 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
@@ -329,6 +329,12 @@ writes nothing, single-turn segments skipped, fixed-window
 control), the type-override default (P2 merges unchanged), and the
 query planner (temporal / typed / keyword / vector routes, typed
 fallback, importance prior, `retrieve_planned`).
+P23 adds the trace store (logging, FTS5 failure search, edit
+audit), the diagnoser (clustering, ranking, proposal), the skill
+file (render / apply / remove, idempotent), the A/B gate (win,
+no-improvement rejection, regression rejection), the nightly loop
+(one kept edit per night) and the full 4-night demo (4 kept, 1
+rejected, final 12/12).
 
 ## P3 — Lychee-style lazy segment consolidation
 
@@ -1008,3 +1014,128 @@ did the small part (idempotent steps).
 - Any agent loop built on the P21 servers (memory/files/tracker)
   can be wrapped the same way: one step per tool call, idempotent
   step bodies, the durable trace for verification.
+
+## P23 — GEPA-style self-improving loop
+
+`gepa.py` implements GEPA (ICLR 2026 Oral) at the harness level:
+no weight updates — log traces, diagnose *why* tasks fail, propose
+one prompt/skill edit per night, A/B it on the fixed P21 task set,
+keep it only if it wins. The skills it writes are Markdown files
+in the agentskills.io standard (frontmatter `name` +
+`description`, then a `## Rules` list), the same shape the Hermes
+Agent repo uses — and the natural `.larp` record for the skill
+itself (P23 is the one plan in this series that feeds larp
+directly: a kept rule is a memory about how the agent should work).
+
+**Phase 1 — trace logging.** `TraceStore` is a second SQLite
+database (`traces.db`): `sessions` (agent, skill version),
+`traces` (one row per task run: prompt, outcome, call count,
+failure text), `trace_calls` (every tool call in order, including
+failed calls), `trace_failures` (each failed verifier check with
+its detail string), and `skill_edits` (the audit table: rule,
+cluster, control/treatment scores, fixed and regressed tasks,
+verdict). `traces_fts` is an FTS5 external-content table over the
+prompt + failure text, trigger-synced like the store's
+`records_fts`, so past failures are searchable
+(`search_failures("deduped")` finds the compute failures). The
+diagnoser reads the store, never the eval's in-memory result —
+the loop is honest about what it actually logged.
+
+**Phase 2 — diagnoser.** `diagnose` clusters a session's failures
+by (task kind, failed verifier check), ranked by cluster size,
+then kind order, then check name — fully deterministic. The top
+cluster maps to one rule from the fixed registry (`RULES`) via
+`RULE_FOR_CLUSTER`, with a per-kind fallback; a cluster with no
+known fix reports "no proposal" instead of guessing. One edit
+per night: `run_nightly` proposes, A/B-tests, and keeps or
+rejects a single edit, then stops.
+
+**Phase 3 — A/B gate.** `ab_test` runs the fixed 12-task set
+twice: control (current skill) vs treatment (current skill +
+candidate). An edit wins only if all three hold: strictly more
+passes, no task the control passed now fails, and at least one
+task in the cluster it was proposed for is fixed. Same discipline
+as P20's adoption gate, on the task set instead of a leave-one-out
+ablation. The metric is the verifier's pass count — objective,
+never the agent's self-assessment.
+
+**The skill agent.** `run_skill_agent` is one deterministic policy
+whose behaviour is gated on the rules in its SKILL.md: a rule it
+does not have, it does not follow. With no rules it is the P21
+`sloppy` policy (1/12); with all four real rules it is `grounded`
+(12/12); each single rule fixes exactly its own kind (dedup → M1–M3,
+supersede → C1–C3, recall-before-write → S1–S2, deliver-in-order →
+D1–D3). The tests pin all three equivalences, so a kept edit's
+effect is attributable to the rule, not to the harness.
+
+Substitutions, stated plainly: there is no LLM, so GEPA's
+proposer (an LLM that reads traces and writes a new prompt) is a
+deterministic cluster→rule map — the loop decides *which* rule
+to try and *whether* it wins, not what the rule says, and it
+cannot invent a fix for a failure mode nobody wrote a rule for.
+The traces are seeded from the fixed 12-task set every night,
+not live production traffic. The bad edit in the demo is a
+PLANTED NEGATIVE (the P2 merge-audit pattern): `complete-first`
+completes the tracker task before writing anything, which must
+regress the deliver tasks and be rejected — it tests that the
+gate can say no, not that the diagnoser proposed it.
+
+Reproduce with `hr eval --gepa --nights 4` (temp-dir demo) or
+`hr eval --gepa --nights 4 --skill skills/tobench-agent/SKILL.md
+--traces traces.db` to persist the skill and its trace store.
+
+### Measured results — four nights, four kept edits, one rejection
+
+| night | eval before | cluster proposed | rule | A/B control → treatment | fixed | verdict |
+|---|---|---|---|---|---|---|
+| 1 | 1/12 | correct/correction_text (n=3) | supersede-on-correct | 1 → 4 | C1–C3 | kept |
+| 2 | 4/12 | compute/value_matches (n=3) | dedup-before-sum | 4 → 7 | M1–M3 | kept |
+| 3 | 7/12 | deliver/deliverable_content (n=3) | recall-deliver-in-order | 7 → 10 | D1–D3 | kept |
+| 4 | 10/12 | summarize/gold_facts_present (n=2) | recall-before-write | 10 → 12 | S1–S2 | kept |
+
+Final skill: 4 rules, final eval **12/12** (summarize 3/3,
+correct 3/3, compute 3/3, deliver 3/3). Planted bad edit
+`complete-first`: control 12 → treatment 9, fixed none,
+regressed D1–D3 → **rejected**. Kept 4, rejected 1 — the plan's
+done condition, met exactly.
+
+The honest reading: the loop works as designed — every night's
+proposal fixed exactly the cluster it named, with zero
+regressions, and the gate caught the one edit that would have
+broken previously-passing tasks. But the result is also
+circular by construction: the rules were written with knowledge
+of the task structure, and the agent follows a rule if and only
+if it has it, so a kept edit "winning" is the harness working
+as designed, not evidence that a real agent would improve.
+What the loop does prove is narrower and is the point of the
+build: the machinery — trace → cluster → propose → A/B →
+keep/reject, with the verdict and its evidence in an audit
+table — runs end to end without a human in it, and the gate
+is strict enough to reject an edit that helps nothing (the
+empty-skill `complete-first` trial: 1 → 1, rejected) as well as
+one that actively regresses (12 → 9, rejected). Drop a real
+model policy and a real proposer into the same slots and the
+verdicts become interesting; until then, publish the loop, not
+the learning curve. The one-edit-per-night cap is what makes a
+bad edit traceable: with four nights there are exactly four
+candidate causes for any regression, each with its A/B in the
+`skill_edits` table.
+
+### Regressions (re-run after P23)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 29,514 tokens saved, faithfulness
+  0.486, 0 violations).
+- VbD eval: identical to P20 (lift +0.333, 8/24 vs 0/24).
+- mini-TOBench: identical to P21 (grounded 12/12, sloppy 1/12).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+- P22 `hr durable demo`: kill/resume proof still passes.
