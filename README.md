@@ -124,6 +124,16 @@ query ──┬── BM25 (FTS5) ────────────┐
   the same SQLite file. The graph is an expander on P1's hybrid
   retriever via `retrieve(..., graph_expander=...)`, never a
   replacement.
+- `hybrid_retriever/lessons.py` — P5: IBM-style lessons miner
+  (`extract_lessons` / `mine_from_eval` / `mine_from_trace_store`
+  / `merge_lessons` / `write_guidelines` / `read_guidelines` /
+  `retrieve_guidelines` / `run_lessons_eval` /
+  `ab_test_guideline` / `planted_backfire_guideline` /
+  `run_lessons_demo`). Deterministic rule-based lesson extraction
+  from P21 verifier verdicts, dedup/merge into a Markdown
+  guidelines file with support + provenance on every guideline,
+  and full-vs-retrieved-subset injection A/B on the fixed P21
+  set through the P23 skill agent.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -619,6 +629,155 @@ only, not by the eval.
 - The `corecall` table is the usage signal P2's TRACE credit
   currently lacks a pair-level form of: a record pair's wsum is
   joint usefulness, where per-record credit is individual.
+
+## P5 — IBM-style lessons miner
+
+`lessons.py` implements "How Much Should an Agent Remember?"
+(arXiv:2611.26361, IBM, ships in altk-evolve) on top of the P21
+harness and the P23 trace store: mine 1–3 short lessons per
+episode from the agent's own trajectories, merge them into a
+guidelines file, inject the guidelines at inference, and A/B
+test full-guideline injection vs retrieved-subset injection.
+Reproduce with `hr eval --lessons` (or `hr lessons [--out
+guidelines.md]`, which persists the mined file — a natural
+`.larp` import).
+
+**Phase 1 — mine.** After each task, `extract_lessons` reads the
+P21 verifier verdict: each failed check becomes a lesson naming
+that check and its fix (the fix text comes from a fixed table
+keyed by check name; for checks the P23 rule registry covers,
+the lesson text IS the registry rule text). A passed episode
+yields one "what worked" lesson, and only when a verifier check
+that maps to a concrete, checkable rule passed. An episode with
+no failure and no such check (S3, prompt-contained) yields zero
+lessons — the miner emits nothing instead of inventing one.
+`mine_from_trace_store` mines the same episodes from the P23
+trace store; the two paths agree on every failure lesson
+(pinned by test), and the one-count difference is documented:
+the store logs only failures, so S3's worked lesson is inferred
+from its kind's primary check there (28 lessons from the store
+vs 27 in-memory).
+
+**Phase 2 — merge.** `merge_lessons` groups lessons by (kind,
+rule-or-check, polarity) and merges near-duplicate canonical
+texts (token Jaccard ≥ 0.8) in a second pass. Every guideline
+tracks `support` (how many lessons it merged), `provenance`
+(the sorted episode ids, unioned on every merge — never
+dropped), and `checks` (the distinct verifier checks that
+produced them). The guidelines file is Markdown with those
+fields in each guideline's header, so the file alone
+reconstructs the merge; `read_guidelines` round-trips it
+(pinned by test, including a test that merges in two stages
+and proves no episode id is lost — the paper's provenance
+failure mode, tested rather than assumed).
+
+**Phase 3 — inject + A/B.** Injection activates a guideline's
+`rule_id` in the P23 skill agent. Three arms on the fixed
+12-task set: `none` (no guidelines), `full` (every guideline
+on every task), `retrieved` (top-k guidelines per task by
+deterministic token overlap with light stemming — no
+embeddings, no LLM ranker). The A/B gate is the P20/P23
+discipline: a candidate ships only if the treatment passes
+strictly more tasks, regresses nothing, and fixes at least one
+task of the target kind. Support is not a gate input.
+
+### Measured results — mine, merge, inject (fixed P21 set)
+
+Mining run (no rules): 1/12 passed, 27 lessons mined → 4 guidelines:
+
+| guideline | kind | support | episodes | rule |
+|---|---|---|---|---|
+| G1 | correct | 9 | C1, C2, C3 | supersede-on-correct |
+| G2 | deliver | 9 | D1, D2, D3 | recall-deliver-in-order |
+| G3 | summarize | 6 | S1, S2 | recall-before-write |
+| G4 | compute | 3 | M1, M2, M3 | dedup-before-sum |
+
+| arm | passed | injected tokens (12 tasks) |
+|---|---|---|
+| none | 1/12 | 0 |
+| retrieved k=1 | 12/12 | 652 |
+| retrieved k=2 | 12/12 | 1,135 |
+| full | 12/12 | 2,592 |
+
+Gate trials: the planted backfire `complete-first` (support
+**12**, synthetically above every real guideline, flagged
+`planted: yes`, provenance `planted-negative`) — control 12 →
+treatment 9, fixed none, regressed D1–D3 → **rejected**. A real
+guideline added to an empty set (`supersede-on-correct`) —
+control 1 → treatment 4, fixed C1–C3, regressed none →
+**kept**. A duplicate of an already-injected rule — 12 → 12,
+not strictly better → **rejected**.
+
+The honest reading: the done condition is met — completion
+improves 1/12 → 12/12 with guidelines, and the gate caught the
+backfire before it shipped — but the interesting measurement is
+the middle column. On this fixed set the retrieved subset
+matches full injection at a quarter of the tokens (k=1: 652 vs
+2,592), which is the paper's point measured rather than
+assumed: the right amount of memory is a property of the
+model, not the memory. That match is also fragile in a way
+worth naming: it depends on the matcher, not just the memory.
+With naive exact-token overlap the retrieved arm scored 10/12
+— the compute guideline was missed for M1/M2 because
+"deduplicating" never matched "deduplicate" — and only the
+light stemmer (suffix + trailing-'e' + doubled-letter steps)
+restored 12/12. On a 4-guideline store that is a toy result;
+the claim that survives is the machinery (mine → merge with
+provenance → inject → gate), not the 12/12. And like P23, the
+result is circular by construction: the lesson table was
+written with knowledge of the task structure, so a mined
+guideline "winning" is the harness working as designed. What
+the build proves is narrower: lessons can be mined, merged,
+and gated without a human in the loop, and a high-support
+guideline that contradicts a verifier rule cannot get in on
+support alone.
+
+Substitutions, stated plainly: there is no LLM, so the miner
+is a deterministic rule-based extractor from verifier verdicts
+and failure clusters (P21 verifiers, P23 trace store), not an
+LLM reading trajectories — a fix the table does not contain can
+never be mined. The trajectories are seeded runs of the
+deterministic skill agent over the fixed 12-task set, not live
+agent traffic. Guideline retrieval is token overlap with light
+stemming, not embeddings. The backfire is a planted negative
+with synthetic support, testing that the gate can say no.
+
+### Regressions (re-run after P5)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 29,514 tokens saved, faithfulness
+  0.486, 0 violations).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+- P20 verify-by-doing lift +0.333 (8/24 vs 0/24, --tasks 24).
+- P21 tobench grounded 12/12, sloppy 1/12.
+- P22 `hr durable demo` kill/resume STATUS SUCCESS, zero violations.
+- P23 `hr eval --gepa --nights 4` 1→4→7→10→12/12, 4 edits kept,
+  1 rejected.
+- P4 `hr eval --corecall` hybrid+corecall any-hit@5 0.625,
+  R@10 0.476 (vs P1 hybrid 0.589/0.393).
+
+## What P5 hooks into (P6+)
+
+- The guidelines file is the harness-level memory the later
+  plans can consume as text: a natural `.larp` import (one
+  record per guideline, provenance in the metadata), and the
+  injection arms are the baseline any learned retriever (P6+
+  territory) has to beat — a learned retriever that cannot beat
+  top-1 token overlap at 652 tokens on this set has not earned
+  its complexity.
+- `ab_test_guideline` is the P20/P23 gate reused at guideline
+  granularity: any future miner that proposes a guideline —
+  including one mined from live traffic instead of the seeded
+  set — goes through the same three conditions before it ships.
 
 ## P18 — CWL structured context eviction
 

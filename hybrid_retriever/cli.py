@@ -151,6 +151,19 @@ def cmd_eval(args) -> None:
             )
         store.close()
         return
+    if args.lessons:
+        from .lessons import (
+            print_lessons_report,
+            run_lessons_demo,
+            write_guidelines,
+        )
+
+        result = run_lessons_demo(k=args.lessons_k)
+        print_lessons_report(result)
+        if args.lessons_out:
+            write_guidelines(args.lessons_out, result["guidelines"])
+            print("guidelines written to %s" % args.lessons_out)
+        return
     if args.trace:
         result = run_synthetic_trace(
             os.path.join("eval_data", "synthetic_corpus.jsonl"),
@@ -470,6 +483,20 @@ def cmd_graph(args) -> None:
     store.close()
 
 
+def cmd_lessons(args) -> None:
+    """P5: run the lessons-miner demo and optionally persist the
+    mined guidelines file (a natural .larp import)."""
+    import shutil
+
+    from .lessons import print_lessons_report, run_lessons_demo
+
+    result = run_lessons_demo(k=args.k)
+    print_lessons_report(result)
+    if args.out:
+        shutil.copyfile(result["guidelines_path"], args.out)
+        print("guidelines written to %s" % args.out)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="hr", description="SQLite hybrid retriever")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -567,6 +594,22 @@ def main() -> None:
         "--traces", default=None,
         help="trace-store SQLite path for --gepa "
         "(default: temp-dir demo store)",
+    )
+    pe.add_argument(
+        "--lessons",
+        action="store_true",
+        help="P5 IBM-style lessons miner: mine lessons from the "
+        "no-rule run, merge into guidelines, A/B none / retrieved / "
+        "full injection on the fixed P21 set, and trial the planted "
+        "backfire guideline through the gate",
+    )
+    pe.add_argument(
+        "--lessons-k", type=int, default=2,
+        help="guidelines retrieved per task for --lessons (default 2)",
+    )
+    pe.add_argument(
+        "--lessons-out", default=None,
+        help="write the mined guidelines file here for --lessons",
     )
     pe.add_argument(
         "--corecall",
@@ -715,6 +758,23 @@ def main() -> None:
     )
     pg.add_argument("--db", required=True)
     pg.set_defaults(func=cmd_graph)
+
+    pl = sub.add_parser(
+        "lessons",
+        help="P5: mine lessons from the no-rule run, merge into "
+        "guidelines, A/B none / retrieved / full injection, trial "
+        "the planted backfire guideline through the gate",
+    )
+    pl.add_argument(
+        "--k", type=int, default=2,
+        help="guidelines retrieved per task in the retrieved arm "
+        "(default 2)",
+    )
+    pl.add_argument(
+        "--out", default=None,
+        help="write the mined guidelines file here",
+    )
+    pl.set_defaults(func=cmd_lessons)
 
     args = p.parse_args()
     args.func(args)
