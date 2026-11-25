@@ -197,6 +197,15 @@ def cmd_eval(args) -> None:
         result = run_scratch_eval()
         print_scratch_report(result)
         return
+    if args.retrieval_drafter:
+        from .retrieval_drafter import (
+            print_retrieval_report,
+            run_retrieval_eval,
+        )
+
+        result = run_retrieval_eval()
+        print_retrieval_report(result)
+        return
     if args.lora:
         from .lora import (
             print_lora_report,
@@ -778,6 +787,16 @@ def main() -> None:
         "chi^2 distribution equivalence over 9200 tokens, "
         "wall-clock at K=6 across configs (toy decoder, "
         "NumPy, no real model, no GPU)",
+    )
+    pe.add_argument(
+        "--retrieval-drafter",
+        action="store_true",
+        help="P12 retrieval-based drafter for small local models "
+        "— prompt-lookup / n-gram drafter vs the P10 bigram "
+        "draft model, both feeding P11's lossless verification "
+        "loop, at small-target (1 work round) and large-target "
+        "(32 work rounds) cost settings (toy decoder, NumPy, "
+        "no real model, no llama.cpp/MLX)",
     )
     pe.add_argument(
         "--corecall",

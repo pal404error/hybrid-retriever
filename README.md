@@ -63,6 +63,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # P11 from-scratch lossless speculative decoding (toy decoder, no real model):
 .venv/bin/python -m hybrid_retriever.cli eval --spec-scratch
+
+# P12 retrieval-based drafter for small local models (toy decoder, no real model):
+.venv/bin/python -m hybrid_retriever.cli eval --retrieval-drafter
 ```
 
 ## Architecture
@@ -193,6 +196,16 @@ query ──┬── BM25 (FTS5) ────────────┐
   scratch (it imports only the toy LM *distributions* from
   P10's `specdec.py`, never its speculative loop), stated in
   the module docstring and the P11 section below.
+- `hybrid_retriever/retrieval_drafter.py` — P12:
+  retrieval-based drafter for small local models
+  (`build_lookup_index` / `PromptLookupDrafter` /
+  `generate_with_drafter` / `run_retrieval_eval`). NumPy
+  only, deterministic, no torch, no llama.cpp/MLX, no real
+  model — a prompt-lookup / n-gram drafter feeding P11's
+  lossless loop unchanged, benchmarked against P10's bigram
+  draft model at a small-target and a large-target cost
+  setting, stated in the module docstring and the P12
+  section below.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -381,7 +394,7 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 307 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 324 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
@@ -490,6 +503,21 @@ simulated work), the from-scratch pin (no speculative-loop
 import from specdec), and eval determinism (χ² statistic
 and long-gen TV identical across runs, benchmark
 accounting on all seven configs).
+P12 adds: the prompt-lookup matching (longest suffix wins
+over shorter, history before corpus at the same length,
+longest match wins across sources, no-match fallback to
+uniform, max-ngram respected, deterministic tie-break),
+retrieval drafter determinism and lookup-stat accounting,
+overhead accounting (zero simulated draft work at 0 cost
+rounds, charged work at DRAFT_COST_ROUNDS), the
+acceptance-rate measurement (accepted / examined, in
+[0, 1], separate from wall-clock), tokens-per-target-
+forward above 1 for both speculative arms, the eval
+structure at both cost settings (the done flag is exactly
+the small-target wall-clock comparison), eval determinism
+(tokens and forwards identical across runs), and the
+reuse pin (verification is P11's speculative_round, not
+P10's lossy loop).
 
 ## P3 — Lychee-style lazy segment consolidation
 
@@ -2053,6 +2081,184 @@ depends entirely on the three conditions above.
   sampling it cannot, so a distributed design inherits
   the same width-is-overhead result unless its
   verification rule differs.
+
+## P12 — Retrieval-based drafter for small local models
+
+`retrieval_drafter.py` implements "An Empirical Study of
+Speculative Decoding for Small Language Models" (EACL 2026)
+on top of P10's toy target and P11's lossless loop: for
+1–2B targets, drafting overhead — not draft quality — is
+the bottleneck, so retrieval-based drafting (near-zero
+overhead) wins. Reproduce with
+`hr eval --retrieval-drafter`. Independent drafting fails
+outright for small targets and is not built here; the
+retrieval drafter is the whole project.
+
+Substitutions, stated plainly: no llama.cpp, no MLX, no
+torch, no real 1–2B model, no model download — the "small
+target" is P10's seeded trigram target + arithmetic head
+over the 64-token vocab, and the "small-target regime" is
+modelled by the cost model, not by a real small model (see
+below). The model-based drafter is P10's bigram draft
+model, reused as-is. Both drafters feed the SAME lossless
+verification loop — P11's `speculative_round`, reused
+unchanged through the thin wrapper `generate_with_drafter`
+(which only loops rounds and counts examined draft tokens
+exactly) — so any wall-clock difference is the drafter,
+not the verifier.
+
+**Phase 1 — prompt-lookup / n-gram drafter.**
+`PromptLookupDrafter` (à la Prompt Lookup Decoding):
+given the current context, find the longest matching
+suffix (up to 5 tokens) in the prompt + generated history
+first (the most recent earlier occurrence, and the token
+that followed it there), then in a fixed lookup corpus
+built from the same synthetic text the toy LM was trained
+on (most frequent continuation, ties by lowest token id),
+and propose its continuation token. The longest match
+wins regardless of source; no match at any length falls
+back to the uniform distribution (only reachable for a
+near-empty context — every vocab token occurs in the
+corpus, so a length-1 suffix almost always hits). The
+proposal is deterministic, so the draft distribution
+handed to the lossless trial is one-hot on that token
+(accept with probability p(token); on rejection repair
+from norm(max(0, p − q))). Drafting cost is a dict lookup
+— no model forward — so the retrieval arm pays ZERO
+simulated draft work.
+
+**Phase 2 — benchmark vs a small draft model, overhead
+measured separately from acceptance rate.** The cost model
+is fixed before measuring: small-target forward = 1
+simulated work round per batched target forward (1/8 of
+P10/P11's default — cheap enough that drafting overhead
+dominates, which is the paper's whole point); large-target
+forward = 32 rounds (P11's config B); model-based draft
+step = 2 rounds of 128×128 simulated work (a small draft
+model is cheaper per forward than the target, but K=6
+steps are charged per verification round, so drafting
+costs roughly one extra small-target forward per round);
+retrieval draft step = 0 rounds. K=6, max_new=24, the
+same 40 prompts, wall-clock mean over 3 repeats.
+Overhead and acceptance are reported as separate columns:
+acceptance rate (accepted / examined draft tokens),
+tokens per target forward, draft steps + simulated draft
+work, draft microseconds per token (microbenchmark over
+2,000 `dist` calls), and wall-clock tokens/sec.
+
+### Measured results — retrieval vs model-based drafting
+
+| setting | arm | tok/s | tok/fwd | accept | tgt fwd | draft steps |
+|---|---|---|---|---|---|---|
+| small-target (1 round) | target-only | 5302.6 | 1.00 | – | 960 | – |
+| small-target (1 round) | model-based | 3008.2 | 2.27 | 0.587 | 422 | 2532 |
+| small-target (1 round) | retrieval | **4782.4** | 2.75 | 0.677 | 349 | 2094 |
+| large-target (32 rounds) | target-only | 247.7 | 1.00 | – | 960 | – |
+| large-target (32 rounds) | model-based | 500.2 | 2.27 | 0.587 | 422 | 2532 |
+| large-target (32 rounds) | retrieval | **652.7** | 2.75 | 0.677 | 349 | 2094 |
+
+Overhead, measured separately: retrieval drafter
+3.69 µs/draft-token vs model drafter 12.31 µs/draft-token
+(3.3×), plus 0 vs 2 simulated work rounds per draft step.
+
+**Done condition: MET** — retrieval beats model-based
+drafting on wall-clock at the small-target setting,
+1.59× (4782.4 vs 3008.2 tok/s). Wall-clock varies
+run-to-run on this shared VM: the regression-suite re-run
+gave the same deterministic columns (acceptance
+0.677/0.587, tok/fwd 2.75/2.27, forwards 349/422) with
+wall-clock 1.82× small-target / 1.22× large-target, so
+the done condition holds in both runs.
+
+**Honest reading — two findings the plan did not
+predict.** First, at the small-target setting even the
+retrieval drafter does not beat target-only sampling
+(0.90×): when the target forward costs 1 simulated round,
+verification overhead dominates and speculative decoding
+barely pays at all — retrieval just loses far less than
+the model-based drafter (0.57×). The paper's point
+survives in the comparison that matters (retrieval vs
+model-based), but the absolute claim "speculative decoding
+pays" does not hold at this cost setting on this toy.
+Second, the expected large-target crossover did NOT
+happen: retrieval also wins at the large-target setting
+(1.30×, 652.7 vs 500.2 tok/s). The reason is visible in
+the acceptance column — the retrieval drafter is not
+just cheaper, it is also the BETTER drafter here
+(acceptance 0.677 vs 0.587, 2.75 vs 2.27 tok/fwd),
+because a 5-gram lookup conditions on far more context
+than the bigram draft model and therefore predicts the
+trigram target better. Draft quality was not held equal
+across the two arms, so this toy cannot isolate the
+overhead effect the way the paper's experiment does (same
+draft quality, overhead varied). What the build proves is
+narrower and still real: on this toy, a lookup drafter
+beats a bigram draft model on wall-clock at both cost
+settings, on overhead (3.3× cheaper per draft token, zero
+simulated draft work) AND on acceptance — and the table
+shows both axes separately so the reader can see the win
+is not overhead alone. Nothing was re-tuned after
+measuring: not the toy LM, not the lookup corpus, not
+the cost model.
+
+### Regressions (re-run after P12)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 29,514 tokens saved, faithfulness
+  0.486, 0 violations).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+- P20 verify-by-doing lift +0.333 (8/24 vs 0/24, --tasks 24).
+- P21 tobench grounded 12/12, sloppy 1/12.
+- P22 `hr durable demo` kill/resume STATUS SUCCESS, zero violations.
+- P23 `hr eval --gepa --nights 4` 1→4→7→10→12/12, 4 edits kept,
+  1 rejected.
+- P4 `hr eval --corecall` hybrid+corecall any-hit@5 0.625,
+  R@10 0.476.
+- P5 `hr eval --lessons` none 1/12, retrieved k=1 12/12, full
+  12/12, backfire rejected.
+- P6 `hr eval --lora` retrieval 0.357, student alone 0.696,
+  student+verify gated 0.714 at 2.23 records/query, planted
+  conflict caught.
+- P7 `hr eval --gaac` 1.455× / 1.600× lossless, bit-exact,
+  attention bit-identical.
+- P8 `hr eval --kvcache` 14.25× / 14.29×, attended-pos top-1
+  0.986/0.964, vocab top-1 0.800/0.734, restart continuation
+  identical, 20× NOT met.
+- P9 `hr eval --e8` E8 k2v2 beats scalar k3v2 in 0/4 settings
+  and scalar k2v2 in 0/4, table trick max abs diff ≤7.5e-09,
+  done NOT met.
+- P10 `hr eval --spec` fixed 2580.0 tok/s, 2.84 tok/fwd, 0.996
+  agree; adaptive 2527.6 tok/s, 2.87 tok/fwd, 0.997 agree;
+  done NOT met (adaptive loses wall-clock −2.0%).
+- P11 `hr eval --spec-scratch` χ² 45.71, df 63, p=0.9504 PASS,
+  wall-clock K=6 config A 1.69×, B 1.99×, C 1.06×, D 1.19×,
+  E 0.24×, F 0.76×, G 0.23×, done MET.
+
+## What P12 hooks into (P13+)
+
+- The lookup index is the retrieval primitive P13 (DISCO)
+  can reuse: if the draft model is replaced by a lookup,
+  the token-index + scalar-probability protocol only needs
+  to ship the proposed token and its target probability —
+  the lookup itself is deterministic given the shared
+  corpus, so both ends can reconstruct the same proposal
+  without shipping a distribution.
+- The cost-model split (target-forward cost vs draft cost
+  vs acceptance) is the measurement P13 needs before
+  splitting draft and target across a wire: a design that
+  adds per-token network latency to the draft step is
+  paying the same kind of overhead this plan measured, and
+  the small-target numbers here say that overhead is what
+  decides whether the split pays.
 
 ## P18 — CWL structured context eviction
 
