@@ -206,6 +206,12 @@ def cmd_eval(args) -> None:
         result = run_retrieval_eval()
         print_retrieval_report(result)
         return
+    if args.disco:
+        from .disco import print_disco_report, run_disco_eval
+
+        result = run_disco_eval()
+        print_disco_report(result)
+        return
     if args.lora:
         from .lora import (
             print_lora_report,
@@ -797,6 +803,19 @@ def main() -> None:
         "loop, at small-target (1 work round) and large-target "
         "(32 work rounds) cost settings (toy decoder, NumPy, "
         "no real model, no llama.cpp/MLX)",
+    )
+    pe.add_argument(
+        "--disco",
+        action="store_true",
+        help="P13 DISCO distributed speculative decoding "
+        "— in-process client/server simulation (no two "
+        "physical machines, no real network): client holds "
+        "the bigram draft, server holds the trigram target "
+        "AND a draft replica; DISCO ships token indices + "
+        "one float32 scalar per token vs naive shipping the "
+        "full 64-float distribution, on a slow (10 KB/s) "
+        "and a fast (10 MB/s) simulated link (toy decoder, "
+        "NumPy, verification is P11's lossless loop)",
     )
     pe.add_argument(
         "--corecall",

@@ -66,6 +66,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # P12 retrieval-based drafter for small local models (toy decoder, no real model):
 .venv/bin/python -m hybrid_retriever.cli eval --retrieval-drafter
+
+# P13 DISCO distributed speculative decoding (in-process client/server simulation, toy decoder, no real model):
+.venv/bin/python -m hybrid_retriever.cli eval --disco
 ```
 
 ## Architecture
@@ -206,6 +209,20 @@ query ──┬── BM25 (FTS5) ────────────┐
   draft model at a small-target and a large-target cost
   setting, stated in the module docstring and the P12
   section below.
+- `hybrid_retriever/disco.py` — P13: DISCO distributed
+  speculative decoding (`Link` / `DiscoClient` /
+  `DiscoServer` / `sample_draft_tokens` /
+  `encode_disco_request` / `encode_naive_request` /
+  `encode_reply` / `generate_split` / `generate_local` /
+  `run_disco_eval`). NumPy only, deterministic, no torch,
+  no real model, no two physical machines, no real
+  network — an in-process client/server simulation over
+  an explicit bandwidth-limited `Link`, token indices +
+  one float32 scalar per token vs the full 64-float
+  distribution, both arms verified by P11's lossless
+  loop unchanged, benchmarked on a slow (10 KB/s) and a
+  fast (10 MB/s) simulated link, stated in the module
+  docstring and the P13 section below.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -394,7 +411,7 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 324 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 342 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
@@ -518,6 +535,24 @@ the small-target wall-clock comparison), eval determinism
 (tokens and forwards identical across runs), and the
 reuse pin (verification is P11's speculative_round, not
 P10's lossy loop).
+P13 adds: the wire format (DISCO 6K bytes/request, NAIVE
+2K + 4KV, reply 3 bytes; encode/decode round-trips exact
+including the float32 scalars and distributions,
+malformed payloads rejected), the Link's latency
+accounting (bytes / bandwidth + per-message overhead,
+exact counters, invalid inputs rejected), the
+server-side draft-replica check (replica is a separate
+object with identical distributions, its recomputed
+scalars match the client-sent ones exactly, a tampered
+scalar fails loudly, the naive arm runs zero replica
+checks), output identity DISCO == naive == local P11
+loop on all 40 prompts, the slow-link vs fast-link
+tokens/sec comparison (DISCO wins on the slow link, the
+saving collapses on the fast one), eval determinism
+(tokens, forwards, bytes and link seconds identical
+across runs), and the reuse pin (verification is P11's
+speculative_round, not P10's lossy loop, pinned by a
+counting wrapper that observes the call).
 
 ## P3 — Lychee-style lazy segment consolidation
 
@@ -2259,6 +2294,224 @@ the cost model.
   paying the same kind of overhead this plan measured, and
   the small-target numbers here say that overhead is what
   decides whether the split pays.
+
+## P13 — DISCO: distributed speculative decoding
+
+`disco.py` implements DISCO (arXiv:2610.35957) on top of
+P10's toy target/draft and P11's lossless loop: split the
+draft model (laptop) from the target model (server)
+without shipping vocab-scale distributions — the server
+keeps a replica of the small draft model, and only token
+indices + one scalar probability per proposed token cross
+the wire. Reproduce with `hr eval --disco`.
+
+Substitutions, stated plainly: this VM has one machine,
+no laptop + server split, no second host, no real
+network — the split is an IN-PROCESS client/server
+simulation, never presented as two physical machines.
+`DiscoClient` holds the draft model (proposer);
+`DiscoServer` holds the target model AND a replica of
+the draft model (a second, separately built `DraftModel`
+from the same sentences — a genuine replica, not the
+same object). No sockets: the two ends exchange real
+serialised byte payloads through an explicit
+bandwidth-limited `Link` object that counts exact bytes
+and simulates latency from a configured bandwidth
+(bytes/sec) plus a fixed per-message overhead. Link time
+is SIMULATED (added to the measured compute wall-clock),
+never slept, so no result depends on network timing.
+The toy decoder is P10/P11's (seeded trigram target +
+arithmetic head, bigram draft, 64-token vocab), and
+verification is P11's `speculative_round`, reused
+unchanged through the thin wrappers `generate_split` /
+`generate_local` — the wrappers only do the protocol
+(propose / encode / send / verify / reply) and loop
+rounds to `max_new`; they do not re-implement the
+rejection trial, the adjusted resample, or the bonus
+token.
+
+**Phase 1 — draft replica on both ends, token-index +
+scalar-probability protocol.** Wire format, fixed before
+measuring: token index uint16 (2 bytes), probability
+float32 (4 bytes), little-endian. Per verification round
+(K=6): DISCO request = 6 token indices + 6 scalars =
+36 bytes; NAIVE request = 6 indices + 6 full 64-float
+distributions = 1548 bytes; reply either way = accepted
+count uint8 + repair/bonus token uint16 = 3 bytes (the
+client already knows its proposed tokens, so the count +
+final token reconstruct the round's output exactly).
+Per-round totals: DISCO 39 bytes, NAIVE 1551 bytes — a
+39.77x ratio before measuring anything. The server's
+DISCO check is the protocol's core invariant: the draft
+probability its replica assigns to each proposed token,
+at its prefix context, must equal the scalar the client
+sent, exactly after the float32 wire cast (2478 checks
+in the eval, 0 mismatches). The naive server holds no
+replica and verifies against the distributions it
+received. One simulation device worth naming: sampling
+on BOTH ends consumes the float32-rounded distribution
+(`_canonical_p`: float32 array → float64, renormalised),
+so the client's proposal and the server's verification
+consume bit-identical distributions — had one end
+sampled from float64 and the other from float32, a
+borderline `rng.choice` draw could flip a token for a
+rounding reason, not a protocol reason. The lossless
+theorem still holds exactly: q is whatever distribution
+both ends agree on, and the trial uses that q
+consistently. The per-round RNG is reseeded
+deterministically (`EVAL_SEED + 7919 * prompt_index +
+round_index`) so client and server derive the same round
+RNG independently — the stand-in for "the client sampled
+these tokens and sent them". The local arm is the same
+P11 loop chained with the same seed schedule and no
+link; it differs from P11's `generate_lossless` only in
+RNG scheduling (per-round reseeding vs one continuous
+stream).
+
+**Phase 2 — benchmark vs naive distribution shipping on
+a slow link.** Two link settings, fixed before measuring:
+slow = 10 KB/s with 1 ms/message overhead (a throttled /
+mobile uplink for the laptop end); fast = 10 MB/s with
+0.1 ms/message. Target-forward cost is P11 config A's
+(8 simulated work rounds), same for every arm and link.
+K=6, max_new=24, the same 40 prompts, wall-clock mean
+over 3 repeats. End-to-end time is measured compute
+wall-clock PLUS simulated link seconds, reported as
+separate columns so the reader can see which dominates.
+Two messages cross per round under either protocol —
+DISCO saves bytes, not round trips, and the overhead
+term keeps that honest.
+
+### Measured results — DISCO vs naive distribution shipping
+
+Local (no split, no link) reference: 1594.2 tok/s,
+2.32 tok/fwd, acceptance 0.593, 413 target forwards,
+960 tokens.
+
+| link | arm | tok/s | tok/fwd | accept | bytes | link s | compute s |
+|---|---|---|---|---|---|---|---|
+| slow (10 KB/s) | DISCO | 296.0 | 2.32 | 0.593 | 16,107 | 2.44 | 0.81 |
+| slow (10 KB/s) | naive | 14.6 | 2.32 | 0.593 | 640,563 | 64.88 | 0.74 |
+| fast (10 MB/s) | DISCO | 1113.2 | 2.32 | 0.593 | 16,107 | 0.08 | 0.78 |
+| fast (10 MB/s) | naive | 1116.9 | 2.32 | 0.593 | 640,563 | 0.15 | 0.71 |
+
+Bandwidth ratio (naive / DISCO): **39.77x** on both
+links — the byte counts are exact (real serialised
+payloads, counted: 413 rounds × 39 vs 413 × 1551).
+Slow-link wall-clock: DISCO 20.23x naive (296.0 vs
+14.6 tok/s). Fast-link wall-clock: DISCO 1.00x naive
+(1113.2 vs 1116.9 tok/s) — the saving collapses to a
+wash, exactly as the crossover predicts. Outputs
+identical (DISCO == naive == local) on all 40 prompts:
+the protocol changes nothing about what gets
+generated, only what crosses the wire — proved by the
+test, not asserted in prose.
+
+**Done condition: MET** — identical outputs, ≥10x
+fewer bytes (39.77x), DISCO wins tok/s on the slow
+link (20.23x).
+
+**Honest reading — three findings.** First, the
+bandwidth ratio is the robust number: it is exact
+arithmetic on the wire format (2 + 4V bytes per token
+vs 2 + 4), so it holds for any link and any prompt set
+at this vocab size — and it is also the number that
+would shrink if the vocab grew and the protocol stayed
+scalar-per-token (it wouldn't: the ratio is ~V, so a
+larger vocab only helps DISCO). Second, the slow-link
+win is a link win, not a decoding win: DISCO runs at
+0.19x the local rate even while beating naive 20x —
+splitting across a 10 KB/s link costs 5x wall-clock
+against not splitting at all, and the naive arm costs
+109x. The plan's key decision ("only worth building if
+you actually have a laptop + server split") survives
+the measurement: on this link the split is worth it
+only against naive shipping, never against local
+decoding. Third, the fast link shows the crossover the
+task asked for, including the part that flatters
+nobody: DISCO is a hair SLOWER than naive there
+(1113.2 vs 1116.9 tok/s, 1.00x) — the server-side
+replica recompute (K bigram distributions per round)
+costs real microseconds that the naive server, holding
+no replica, does not pay, and at 10 MB/s the 39.77x
+byte saving buys back less than that recompute costs.
+On a fast link the right answer is not DISCO, it is
+either protocol — the bytes differ 40x and the clock
+does not. Nothing was re-tuned after measuring: not
+the vocab, not the wire format, not the link
+parameters.
+
+### Regressions (re-run after P13)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 29,514 tokens saved, faithfulness
+  0.486, 0 violations).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+- P20 verify-by-doing lift +0.333 (8/24 vs 0/24, --tasks 24).
+- P21 tobench grounded 12/12, sloppy 1/12.
+- P22 `hr durable demo` kill/resume STATUS SUCCESS, zero violations.
+- P23 `hr eval --gepa --nights 4` 1→4→7→10→12/12, 4 edits kept,
+  1 rejected.
+- P4 `hr eval --corecall` hybrid+corecall any-hit@5 0.625,
+  R@10 0.476.
+- P5 `hr eval --lessons` none 1/12, retrieved k=1 12/12, full
+  12/12, backfire rejected.
+- P6 `hr eval --lora` retrieval 0.357, student alone 0.696,
+  student+verify gated 0.714 at 2.23 records/query, planted
+  conflict caught.
+- P7 `hr eval --gaac` 1.455× / 1.600× lossless, bit-exact,
+  attention bit-identical.
+- P8 `hr eval --kvcache` 14.25× / 14.29×, attended-pos top-1
+  0.986/0.964, vocab top-1 0.800/0.734, restart continuation
+  identical, 20× NOT met.
+- P9 `hr eval --e8` E8 k2v2 beats scalar k3v2 in 0/4 settings
+  and scalar k2v2 in 0/4, table trick max abs diff ≤7.5e-09,
+  done NOT met.
+- P10 `hr eval --spec` fixed 2580.0 tok/s, 2.84 tok/fwd, 0.996
+  agree; adaptive 2527.6 tok/s, 2.87 tok/fwd, 0.997 agree;
+  done NOT met (adaptive loses wall-clock −2.0%).
+- P11 `hr eval --spec-scratch` χ² 45.71, df 63, p=0.9504 PASS,
+  wall-clock K=6 config A 1.69×, B 1.99×, C 1.06×, D 1.19×,
+  E 0.24×, F 0.76×, G 0.23×, done MET.
+- P12 `hr eval --retrieval-drafter` small-target retrieval
+  4782.4 tok/s vs model-based 3008.2 (1.59×), acceptance
+  0.677 vs 0.587, overhead 3.69µs vs 12.31µs, done MET.
+
+Wall-clock tok/s varies run-to-run on this shared VM
+(this run: P10 fixed 2140.7 / adaptive 2126.5 tok/s;
+P11 config A 1.76×, B 2.05×; P12 small-target 1.77×);
+every deterministic column above is identical to its
+baseline, and every done / NOT-met verdict above is
+unchanged.
+
+## What P13 hooks into (P14+)
+
+- The `Link` is the reusable piece: any later plan that
+  splits work across a wire (P14's layer-wise offload
+  runner, or a real laptop + server deployment of this
+  speculative loop) can reuse the byte-counting +
+  simulated-latency accounting instead of re-deriving
+  it, and the per-message overhead term is the warning
+  built into it — a protocol that saves bytes but not
+  round trips still pays the overhead on every round.
+- The replica-consistency check is the pattern for
+  keeping two ends of a split honest: the server
+  re-derives what the client sent and fails loudly on
+  divergence, rather than trusting the wire. Any split
+  that replaces the draft with a lookup (P12's drafter
+  over this protocol) gets the same check for free — the
+  lookup is deterministic given the shared corpus, so
+  both ends reconstruct the same proposal without
+  shipping a distribution at all.
 
 ## P18 — CWL structured context eviction
 
