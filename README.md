@@ -69,6 +69,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # P13 DISCO distributed speculative decoding (in-process client/server simulation, toy decoder, no real model):
 .venv/bin/python -m hybrid_retriever.cli eval --disco
+
+# P14 minimal layer-wise offload runner (toy model, pure NumPy, no torch, no GPU, no 70B model):
+.venv/bin/python -m hybrid_retriever.cli eval --offload
 ```
 
 ## Architecture
@@ -223,6 +226,19 @@ query ──┬── BM25 (FTS5) ────────────┐
   loop unchanged, benchmarked on a slow (10 KB/s) and a
   fast (10 MB/s) simulated link, stated in the module
   docstring and the P13 section below.
+- `hybrid_retriever/offload.py` — P14: minimal layer-wise
+  offload runner (`quantise_q4` / `dequantise_q4` /
+  `build_toy_model` / `build_weights_in_memory` /
+  `q4_error_stats` / `OffloadRunner` / `AllInRamModel` /
+  `run_offload_eval`). NumPy only, deterministic, no
+  torch, no GPU, no 70B model — a toy transformer-like
+  stack (32 layers x hidden 128, ~0.54M parameters) with
+  one Q4-quantised .npz shard per layer on disk, loaded
+  one layer at a time under a hard byte cap on cached
+  layer weights, with background-thread prefetch of layer
+  N+1 and a cap-bounded LRU cache, benchmarked on /tmp
+  (tmpfs) vs the home disk, stated in the module
+  docstring and the P14 section below.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -411,7 +427,7 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 342 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 357 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
@@ -553,6 +569,28 @@ saving collapses on the fast one), eval determinism
 across runs), and the reuse pin (verification is P11's
 speculative_round, not P10's lossy loop, pinned by a
 counting wrapper that observes the call).
+P14 adds: the Q4 round-trip (error within the scale/2
+rounding bound, zeros stay zero, determinism, odd
+lengths and non-multiples of the group size, ~6.4×
+smaller than FP32 with the bound holding on the full
+32-layer stack), the offload runner matching all-in-RAM
+exactly (token-for-token, final-hidden diff ≤ 1e-5)
+with and without the cache and with and without
+prefetch, the model-bigger-than-cap case (544,768
+params, 344,064 Q4 bytes vs a 66,048 B cap: correct
+outputs, peak held exactly at the cap, evictions > 0),
+the cap-too-small rejection, the no-cache control (one
+disk load per layer per token), prefetch output identity
+with real prefetch accounting, the LRU eviction order
+(2-layer cap ends holding layers {6, 7} with 6
+evictions; an 8-layer cap is 8/8 hits on the second
+token with 0 evictions), and benchmark determinism
+(all non-timing columns identical across two full eval
+runs; prefetch load counts excluded, since the
+worker/main race decides who loads a layer) plus the
+done-condition shape (model bigger than cap, outputs
+match, cap respected, RSS measured on both arms, 36
+benchmark cells).
 
 ## P3 — Lychee-style lazy segment consolidation
 
@@ -2503,6 +2541,14 @@ unchanged.
   it, and the per-message overhead term is the warning
   built into it — a protocol that saves bytes but not
   round trips still pays the overhead on every round.
+- The `Link` is the reusable piece: any later plan that
+  splits work across a wire (P14's layer-wise offload
+  runner, or a real laptop + server deployment of this
+  speculative loop) can reuse the byte-counting +
+  simulated-latency accounting instead of re-deriving
+  it, and the per-message overhead term is the warning
+  built into it — a protocol that saves bytes but not
+  round trips still pays the overhead on every round.
 - The replica-consistency check is the pattern for
   keeping two ends of a split honest: the server
   re-derives what the client sent and fails loudly on
@@ -2512,6 +2558,259 @@ unchanged.
   lookup is deterministic given the shared corpus, so
   both ends reconstruct the same proposal without
   shipping a distribution at all.
+
+## P14 — Minimal layer-wise offload runner (potato-PC project)
+
+`offload.py` implements the AirLLM idea from scratch in
+pure NumPy: load one layer at a time from disk, forward
+through it, free it — so a model whose weights do not fit
+in RAM still runs. Reproduce with `hr eval --offload`.
+
+Substitutions, stated plainly: there is no torch, no GPU
+and no 70B model on this VM, so the model is a TOY
+transformer-like stack — 32 layers of a 128×128 linear
+layer + bias with a tanh nonlinearity, a 64-token
+embedding table and a 64-token unembedding table,
+**544,768 parameters** in total, weights stored on disk
+as one Q4-quantised `.npz` shard per layer. The claim
+this build proves is about the MECHANISM (offload under
+a hard RAM cap), not the scale; the word "70B" appears
+in the code only to say the real run is not reproduced.
+Quantisation comes first, offload second, per the plan:
+layer weights are Q4 (symmetric per-group scales, group
+of 32, codes in [−7, 7], two codes per byte — 6.14×
+smaller than FP32 for the full 32-layer stack, bias
+included) and the runner dequantises one layer at a
+time. The FP32 originals are never stored on disk; the
+Q4 error is measured in memory against the same seeded
+weights the disk model is built from.
+
+**The RAM cap** is a configured byte budget enforced by
+the runner on the LAYER WEIGHTS it holds: the cached
+dequantised FP32 layer bytes never exceed the cap
+(`peak_held_bytes` is tracked and asserted in tests; a
+cap smaller than one layer raises at construction). The
+embedding / unembedding tables (32 KiB total) are
+resident for the whole run and are reported separately
+as fixed overhead — the cap covers the offloaded stack,
+which is the part AirLLM offloads. Peak RSS is measured
+separately, in a fresh child process per run (the model
+is built by the parent, never in the child, so
+build-time allocations never enter the number), and is
+reported alongside the cap — raw RSS includes the
+Python + NumPy interpreter baseline (~209 MB here), so
+RSS is NEVER compared against the byte cap; the honest
+RSS comparison is offload vs all-in-RAM on the same
+model.
+
+**Phase 1 — load → forward → free.** With the cache
+off, every layer is loaded from its shard, used once
+and freed: 8 layers × 4 tokens = 32 disk loads, 0 cache
+hits, 0 bytes held (pinned by test).
+
+**Phase 2 — prefetch.** A background thread loads
+layer N+1's packed shard from disk while layer N
+computes (threading + a bounded queue of depth 1, for
+both the request and the result). The thread only ever
+loads packed bytes; dequantisation and all cap
+accounting happen on the main thread, so the cap cannot
+be breached by a racing insert. A delivered shard the
+main thread already loaded synchronously is dropped,
+never waited on — the first version blocked the worker
+on a 5-second queue put for exactly that case and one
+benchmark cell collapsed to 3.0 tok/s; the fix is a
+non-blocking put plus a stop event the worker actually
+checks.
+
+**Phase 3 — LRU cache + benchmark table.** The cache
+holds dequantised layers in LRU order, bounded by the
+cap: at a 2-layer cap over an 8-layer model one forward
+pass ends holding layers {6, 7} with 6 evictions; at an
+8-layer cap the second token is 8/8 cache hits with 0
+evictions (both pinned by test). The benchmark table is
+layers (16, 32) × RAM cap (1, 2, 4 layers) × disk
+(/tmp tmpfs vs home disk) × mode (offload,
+offload+prefetch, all-in-RAM), 16 tokens per cell.
+
+### Measured results — Q4 + done-condition run
+
+32-layer toy model, 544,768 parameters, Q4 layer weights
+344,064 B, RAM cap 66,048 B (one layer) — the model is
+5.2× bigger than the cap. Reproduce with
+`hr eval --offload`.
+
+| | |
+|---|---|
+| Q4 max abs weight error | 0.031649 (rounding bound max scale/2 = 0.032050; bound holds) |
+| Q4 mean abs weight error | 0.007198 |
+| Q4 size | FP32 2,113,536 B → Q4 344,064 B (6.14×) |
+| 1-token logits error from quantisation | max 0.125622, mean 0.037407 |
+| Outputs match all-in-RAM | yes — identical tokens, max abs final-hidden diff 0.00e+00 |
+| Peak layer bytes held | 66,048 B = cap exactly (respected) |
+| Peak RSS, offload (prefetch) | 209,232 KiB |
+| Peak RSS, all-in-RAM | 209,232 KiB (delta +0 KiB) |
+| tok/s | offload (prefetch) 41.3 vs all-in-RAM 6,911.5 |
+
+**Honest reading — three things, none of them flattering.**
+First, the RSS comparison is a null result at this scale:
+both arms measure 209,232 KiB, because the interpreter +
+NumPy baseline (~209 MB) swamps the 2.1 MB FP32 stack the
+offload run avoids holding. The cap evidence is therefore
+`peak_held_bytes` (66,048 B, exactly the cap), not RSS —
+RSS is reported so the null is visible instead of hidden,
+and a byte cap must never be "verified" by comparing it
+to a 209 MB process. Second, offload is ~167× slower than
+all-in-RAM (41.3 vs 6,911.5 tok/s): each token re-reads
+all 32 shards through `np.load`, and disk loads dominate
+the 20 µs matvec. That is the plan's fit ≠ speed in
+numbers — the model runs under the cap, and it runs
+slowly, exactly as the ~10 s/token guide estimate warned
+for the real thing. Third, prefetch LOSES on this toy:
+52.8 tok/s without it vs 44.9 tok/s with it (0.85×) at
+32 layers / 1-layer cap / tmpfs, tokens identical. The
+mechanism is correct (same outputs, pinned by test) but
+the overlap is not there to take: `np.load` is
+Python-heavy and GIL-bound, the main thread's compute
+per layer is a single small matvec, so the loader thread
+steals the GIL from the compute it is meant to overlap
+with — and the race adds duplicate loads (555 vs 512
+disk reads in that cell). Prefetch would only pay when
+compute per layer is large relative to the loader's
+Python overhead (a real GPU forward, or a loader that
+does its work in C) — on this toy it is a measured
+0.85×, reported as such.
+
+### Measured results — benchmark table (layers × RAM cap × disk → tok/s)
+
+16 tokens per cell, tok/s is wall-clock (varies run to
+run on this shared VM — the deterministic columns are
+the token lists, load / hit / eviction counts and peak
+held bytes, pinned by test across two full eval runs).
+tmpfs vs home disk are indistinguishable at these shard
+sizes (10 KiB per layer): the cost is `np.load`'s Python
+overhead, not the device — 16-layer offload is 93–111
+tok/s on both disks, 32-layer offload 43–54 tok/s on
+both, and the cap barely matters either (a bigger cap
+only helps if a layer is reused before eviction, and a
+forward pass never revisits a layer within one token).
+All-in-RAM is 6,400–13,500 tok/s everywhere, which is
+the ceiling the table is measured against, not a
+competitor the offload runner is trying to beat.
+
+| layers | cap | disk | mode | tok/s | loads | hits | evictions | peak held B |
+|---|---|---|---|---|---|---|---|---|
+| 16 | 1L | tmpfs | offload | 93.2 | 256 | 0 | 255 | 66,048 |
+| 16 | 1L | tmpfs | offload+prefetch | 99.4 | 265 | 0 | 255 | 66,048 |
+| 16 | 1L | tmpfs | all-in-ram | 12,425.2 | 16 | 0 | 0 | 1,056,768 |
+| 16 | 2L | tmpfs | offload | 99.9 | 256 | 0 | 254 | 132,096 |
+| 16 | 2L | tmpfs | offload+prefetch | 91.2 | 283 | 0 | 254 | 132,096 |
+| 16 | 2L | tmpfs | all-in-ram | 12,705.7 | 16 | 0 | 0 | 1,056,768 |
+| 16 | 4L | tmpfs | offload | 104.4 | 256 | 0 | 252 | 264,192 |
+| 16 | 4L | tmpfs | offload+prefetch | 81.8 | 278 | 0 | 252 | 264,192 |
+| 16 | 4L | tmpfs | all-in-ram | 13,105.0 | 16 | 0 | 0 | 1,056,768 |
+| 16 | 1L | disk | offload | 104.7 | 256 | 0 | 255 | 66,048 |
+| 16 | 1L | disk | offload+prefetch | 91.6 | 276 | 0 | 255 | 66,048 |
+| 16 | 1L | disk | all-in-ram | 13,352.3 | 16 | 0 | 0 | 1,056,768 |
+| 16 | 2L | disk | offload | 102.6 | 256 | 0 | 254 | 132,096 |
+| 16 | 2L | disk | offload+prefetch | 90.7 | 272 | 0 | 254 | 132,096 |
+| 16 | 2L | disk | all-in-ram | 12,890.9 | 16 | 0 | 0 | 1,056,768 |
+| 16 | 4L | disk | offload | 103.0 | 256 | 0 | 252 | 264,192 |
+| 16 | 4L | disk | offload+prefetch | 92.5 | 291 | 0 | 252 | 264,192 |
+| 16 | 4L | disk | all-in-ram | 13,240.6 | 16 | 0 | 0 | 1,056,768 |
+| 32 | 1L | tmpfs | offload | 53.6 | 512 | 0 | 511 | 66,048 |
+| 32 | 1L | tmpfs | offload+prefetch | 45.6 | 555 | 0 | 511 | 66,048 |
+| 32 | 1L | tmpfs | all-in-ram | 6,771.6 | 32 | 0 | 0 | 2,113,536 |
+| 32 | 2L | tmpfs | offload | 50.2 | 512 | 0 | 510 | 132,096 |
+| 32 | 2L | tmpfs | offload+prefetch | 46.6 | 545 | 0 | 510 | 132,096 |
+| 32 | 2L | tmpfs | all-in-ram | 6,838.3 | 32 | 0 | 0 | 2,113,536 |
+| 32 | 4L | tmpfs | offload | 53.1 | 512 | 0 | 508 | 264,192 |
+| 32 | 4L | tmpfs | offload+prefetch | 45.2 | 559 | 0 | 508 | 264,192 |
+| 32 | 4L | tmpfs | all-in-ram | 6,652.2 | 32 | 0 | 0 | 2,113,536 |
+| 32 | 1L | disk | offload | 50.9 | 512 | 0 | 511 | 66,048 |
+| 32 | 1L | disk | offload+prefetch | 43.9 | 564 | 0 | 511 | 66,048 |
+| 32 | 1L | disk | all-in-ram | 6,523.1 | 32 | 0 | 0 | 2,113,536 |
+| 32 | 2L | disk | offload | 42.8 | 512 | 0 | 510 | 132,096 |
+| 32 | 2L | disk | offload+prefetch | 37.7 | 610 | 0 | 510 | 132,096 |
+| 32 | 2L | disk | all-in-ram | 6,677.6 | 32 | 0 | 0 | 2,113,536 |
+| 32 | 4L | disk | offload | 50.8 | 512 | 0 | 508 | 264,192 |
+| 32 | 4L | disk | offload+prefetch | 41.0 | 595 | 0 | 508 | 264,192 |
+| 32 | 4L | disk | all-in-ram | 6,641.4 | 32 | 0 | 0 | 2,113,536 |
+
+The done condition, honestly translated: a toy model
+whose total Q4 weights (344,064 B) exceed the RAM cap
+(66,048 B) runs correctly under the offload runner
+(outputs identical to all-in-RAM, peak held exactly at
+the cap) and the benchmark table above is published
+with real measured numbers — **done MET**, for the
+mechanism, not the scale.
+
+### Regressions (re-run after P14)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 29,514 tokens saved, faithfulness
+  0.486, 0 violations).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+- P20 verify-by-doing lift +0.333 (8/24 vs 0/24, --tasks 24).
+- P21 tobench grounded 12/12, sloppy 1/12.
+- P22 `hr durable demo` kill/resume STATUS SUCCESS, zero violations.
+- P23 `hr eval --gepa --nights 4` 1→4→7→10→12/12, 4 edits kept,
+  1 rejected.
+- P4 `hr eval --corecall` hybrid+corecall any-hit@5 0.625,
+  R@10 0.476.
+- P5 `hr eval --lessons` none 1/12, retrieved k=1 12/12, full
+  12/12, backfire rejected.
+- P6 `hr eval --lora` retrieval 0.357, student alone 0.696,
+  student+verify gated 0.714 at 2.23 records/query, planted
+  conflict caught.
+- P7 `hr eval --gaac` 1.455× / 1.600× lossless, bit-exact,
+  attention bit-identical.
+- P8 `hr eval --kvcache` 14.25× / 14.29×, attended-pos top-1
+  0.986/0.964, vocab top-1 0.800/0.734, restart continuation
+  identical, 20× NOT met.
+- P9 `hr eval --e8` E8 k2v2 beats scalar k3v2 in 0/4 settings
+  and scalar k2v2 in 0/4, table trick max abs diff 1.86e-09
+  (≤7.5e-09 baseline bound), done NOT met.
+- P10 `hr eval --spec` fixed 2.84 tok/fwd, 0.996 agree;
+  adaptive 2.87 tok/fwd, 0.997 agree — the deterministic
+  columns are identical to baseline, but the done flag
+  reads **True** this run: adaptive 2472.3 tok/s vs fixed
+  2465.9 tok/s (+0.3%), where the baseline run had adaptive
+  losing wall-clock −2.0% (2580.0 vs 2527.6 tok/s). The two
+  arms are within a third of a percent of each other, so
+  the verdict flips on shared-VM wall-clock noise alone;
+  nothing in the code changed, and the baseline conclusion
+  — adaptive does not win wall-clock — is not overturned
+  by a +0.3% noise flip. This is the same wall-clock
+  variance the P13 notes already record for P10–P12, now
+  with a verdict attached to it.
+- P11 `hr eval --spec-scratch` χ² 45.71, df 63, p=0.9504 PASS,
+  wall-clock K=6 config A 1.66×, B 2.12× (baseline 1.69×,
+  1.99× — wall-clock varies), done MET.
+- P12 `hr eval --retrieval-drafter` small-target retrieval
+  6938.4 tok/s vs model-based 3991.8 (1.74×; baseline
+  4782.4 vs 3008.2, 1.59× — wall-clock varies), acceptance
+  0.677 vs 0.587, overhead 3.89µs vs 9.17µs (baseline
+  3.69µs vs 12.31µs — wall-clock varies), done MET.
+- P13 `hr eval --disco` 39.77× bandwidth saving (16,107 vs
+  640,563 bytes), slow link 315.4 vs 14.7 tok/s (21.50×;
+  baseline 296.0 vs 14.6, 20.23× — wall-clock varies),
+  fast link 1.08× (baseline 1.00×), output identity proved,
+  done MET.
+
+Wall-clock tok/s varies run-to-run on this shared VM;
+every deterministic column above is identical to its
+baseline, and every done / NOT-met verdict above is
+unchanged except P10's, which flipped on noise as
+explained.
 
 ## P18 — CWL structured context eviction
 

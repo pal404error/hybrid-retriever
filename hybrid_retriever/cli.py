@@ -212,6 +212,12 @@ def cmd_eval(args) -> None:
         result = run_disco_eval()
         print_disco_report(result)
         return
+    if args.offload:
+        from .offload import print_offload_report, run_offload_eval
+
+        result = run_offload_eval()
+        print_offload_report(result)
+        return
     if args.lora:
         from .lora import (
             print_lora_report,
@@ -816,6 +822,17 @@ def main() -> None:
         "full 64-float distribution, on a slow (10 KB/s) "
         "and a fast (10 MB/s) simulated link (toy decoder, "
         "NumPy, verification is P11's lossless loop)",
+    )
+    pe.add_argument(
+        "--offload",
+        action="store_true",
+        help="P14 minimal layer-wise offload runner "
+        "— Q4-quantised toy transformer-like model in pure "
+        "NumPy (no torch, no GPU, no 70B model): load one "
+        "layer shard from disk, forward, free it under a "
+        "hard RAM cap, with prefetch + LRU cache and a "
+        "benchmark table (layers x RAM cap x disk -> tok/s) "
+        "measured on /tmp (tmpfs) vs the home disk",
     )
     pe.add_argument(
         "--corecall",
