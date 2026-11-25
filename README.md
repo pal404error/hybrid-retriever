@@ -57,6 +57,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # P9 E8 lattice key quantisation (k2v2) (synthetic KV, no real model):
 .venv/bin/python -m hybrid_retriever.cli eval --e8
+
+# P10 AdaptiveSpec (toy decoder, no real model):
+.venv/bin/python -m hybrid_retriever.cli eval --spec
 ```
 
 ## Architecture
@@ -1617,6 +1620,169 @@ fidelity eval — not that k2v2 beats k3v2 on a real model.
 - The fallback diagnostic is the open lever: the overload
   tail, not the lattice geometry, is where E8 loses most of
   its flips to scalar k2 on this data.
+
+## P10 — AdaptiveSpec: adaptive lossy speculative decoding
+
+`specdec.py` implements AdaptiveSpec (arXiv:2609.02897) as
+a deterministic TOY DECODER in pure NumPy: a margin rule
+promotes mismatched draft tokens, and a tree policy
+reshapes draft depth/width per step from draft confidence
++ rolling acceptance. Reproduce with `hr eval --spec`.
+
+Substitutions, stated plainly: this VM has no torch, no
+GPU, no vLLM/SGLang, no EAGLE-3, no real LM, and no
+GSM8K/MATH-500/HumanEval, so **no real model ran, no
+EAGLE-3 ran, no benchmark ran, and none is pretended**.
+The target is a seeded trigram LM over a 64-token vocab
+trained on fixed synthetic text (3,000 arithmetic
+sentences + 3,000 filler sentences, seed 20261126) plus a
+deterministic arithmetic head: when the context ends in a
+pending `A op B` answer position, 90% of the target mass
+goes on the correct next answer digit. The draft is a
+bigram LM over the same vocab with no arithmetic head — it
+cannot compute answers, which is the gap the margin rule
+and the tree policy have to work with. The EAGLE-like
+baseline is FIXED-TREE speculative decoding (depth 3,
+width 2) on the SAME draft/target and the SAME margin
+rule, so the adaptive policy's effect is measured in
+isolation — a fixed tree is just EAGLE, per the plan's
+key decision. Accuracy is AGREEMENT with target-only
+greedy decoding on a fixed 40-prompt set (24 arithmetic,
+16 filler): token-level agreement + sequence exact-match,
+plus the checkable arithmetic task (the emitted answer
+must match the target-only answer) as the GSM8K-style
+analogue with verifiable answers.
+
+**Margin rule (the lossy acceptance).** A mismatched draft
+token `t` is accepted when `p_target(t) >= max(p_target)
+- margin`, boundary inclusive, with `margin = 0.05`
+fixed before measuring. At margin 0 only a target top-1
+token is accepted, so speculative output equals
+target-only greedy output exactly (pinned by test; exact
+ties are broken toward the lowest-index token by a 1e-12
+tilt so a tied non-argmax draft token is rejected).
+
+**Adaptive tree policy (the contribution; exact rule).**
+Draft confidence `c` = draft top-1 probability at the
+round's root; rolling acceptance `a` = EMA (alpha 0.25,
+init 0.5) of the per-round acceptance rate (accepted draft
+tokens / draft tokens examined on the accepted path,
+bonus token excluded). Shape chosen per round BEFORE
+drafting: `a >= 0.7 and c >= 0.5` → depth 5, width 3;
+`a >= 0.5 and c >= 0.35` → depth 4, width 2; `a < 0.3 or
+c < 0.2` → depth 2, width 1; otherwise depth 3, width 2.
+Tree nodes capped at 40.
+
+**Throughput accounting (the cost model).** Two metrics:
+(1) TOKENS PER TARGET FORWARD — deterministic: one
+batched target pass per verification round, however many
+tree nodes it covers; target-only greedy scores exactly
+1.0. (2) WALL-CLOCK tokens/sec on CPU. The target
+forward's cost is SIMULATED: each forward does one fixed
+block of elementwise NumPy work (8 × a 384×384 float32
+reduction — the weight-load-dominated cost analogue,
+independent of batch size) plus a tiny per-node vector
+op, so a batched verification round costs ~one forward,
+not one forward per node. The simulated work is real
+compute folded into a checksum; its size is fixed before
+measuring and identical for every arm. Draft forwards are
+cheap bigram lookups with precomputed rankings. Wall-clock
+is therefore a property of this cost model, not of a real
+LM — the tokens-per-forward column is the portable
+number.
+
+### Measured results — fixed tree vs adaptive tree (toy decoder)
+
+| arm | tok/sec | tok/target-fwd | target fwd | draft fwd | token agree | seq exact | arith match |
+|---|---|---|---|---|---|---|---|
+| target-only | 1282.5 | 1.00 | 960 | 0 | 1.000 | 1.000 | 24/24 |
+| fixed (EAGLE-like) | 2580.0 | 2.84 | 338 | 2366 | 0.996 | 0.950 | 24/24 |
+| adaptive | 2527.6 | 2.87 | 335 | 2739 | 0.997 | 0.975 | 24/24 |
+
+Margin 0.05, max 24 new tokens, 40 prompts, wall-clock
+mean over 3 repeats. A second full run confirmed the
+deterministic columns exactly (2.84 / 2.87 tok/fwd, 0.996
+/ 0.997 agreement) and the wall-clock ordering (fixed
+2501.1 vs adaptive 2376.2 tok/sec).
+
+**Done condition NOT met, and the reason is measured,
+not tuned away.** The adaptive arm beats the fixed tree
+on tokens-per-target-forward (2.87 vs 2.84, +1.1%) and
+retains agreement (0.997 token-level, 0.975 sequence
+exact-match, 24/24 arithmetic answers) — but it LOSES
+on wall-clock (2527.6 vs 2580.0 tok/sec, −2.0%). The
+policy does reshape: it used all four shapes (122×
+(3,2), 91× (4,2), 23× (5,3), 99× (2,1)), and the wider
+trees bought 3 fewer target forwards (335 vs 338) — but
+they cost 373 extra draft forwards (2739 vs 2366,
++15.8%), and on this CPU that draft expansion outweighs
+the saved target forwards. The honest reading: on a toy
+where the target forward is a simulated ~1 ms and the
+draft is a Python-level tree expansion, widening the tree
+is roughly a wash — the policy's win is real but small
+in the cost model (+1.1% tok/fwd) and negative once
+draft overhead is counted. A cheaper draft expansion (or
+a genuinely more expensive target) is what would flip
+the wall-clock sign, and that is a property of the
+deployment, not of the policy. Nothing was re-tuned
+after measuring: margin, LM, prompt set, policy
+thresholds, and simulated-cost size were fixed before
+the eval ran, and the numbers above are as measured.
+
+### Regressions (re-run after P10)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 29,514 tokens saved, faithfulness
+  0.486, 0 violations).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+- P20 verify-by-doing lift +0.333 (8/24 vs 0/24, --tasks 24).
+- P21 tobench grounded 12/12, sloppy 1/12.
+- P22 `hr durable demo` kill/resume STATUS SUCCESS, zero violations.
+- P23 `hr eval --gepa --nights 4` 1→4→7→10→12/12, 4 edits kept,
+  1 rejected.
+- P4 `hr eval --corecall` hybrid+corecall any-hit@5 0.625,
+  R@10 0.476 (vs P1 hybrid 0.589/0.393).
+- P5 `hr eval --lessons` none 1/12, retrieved k=1 12/12, full 12/12,
+  planted backfire guideline rejected.
+- P6 `hr eval --lora` retrieval 0.357, student alone 0.696,
+  student+verify gated 0.714 at 2.23 records/query, planted
+  conflict caught.
+- P7 `hr eval --gaac` 1.455× / 1.600× lossless, bit-exact,
+  attention bit-identical, on-the-fly 6.0× less peak memory.
+- P8 `hr eval --kvcache` 14.25× / 14.29×, attended-pos top-1
+  0.986/0.964, vocab top-1 0.800/0.734, restart continuation
+  identical, 20× target NOT met.
+- P9 `hr eval --e8` E8 k2v2 beats scalar k3v2 in 0/4 settings
+  and scalar k2v2 in 0/4, table trick max abs diff ≤7.5e-09,
+  done condition NOT met.
+
+## What P10 hooks into (P11+)
+
+- The margin rule is the lossy knob P11 (from-scratch
+  speculative decoding) needs for its distribution-
+  equivalence check: at margin 0 the toy decoder is
+  exactly equivalent to the target, so P11's χ² test has
+  a known-good baseline to compare against.
+- The simulated batched-forward cost model is the
+  reusable piece: P11's "when does it not pay" note and
+  P12's drafting-overhead measurement both need a
+  target-forward cost that is one forward per round
+  regardless of tree size, with draft cost counted
+  separately — that split is what made P10's wall-clock
+  loss legible instead of mysterious.
+- The arithmetic-head target is a reusable verifiable-
+  answer harness: any later speculative variant can
+  score answer agreement on the same 24 prompts without
+  touching a real benchmark.
 
 ## P18 — CWL structured context eviction
 

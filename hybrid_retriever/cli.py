@@ -182,6 +182,12 @@ def cmd_eval(args) -> None:
         result = run_e8_eval()
         print_e8_report(result)
         return
+    if args.spec:
+        from .specdec import print_spec_report, run_spec_eval
+
+        result = run_spec_eval()
+        print_spec_report(result)
+        return
     if args.lora:
         from .lora import (
             print_lora_report,
@@ -744,6 +750,16 @@ def main() -> None:
         "synthetic correlated BF16-baseline KV, plus the "
         "table-based scoring check (no real model, no "
         "perplexity)",
+    )
+    pe.add_argument(
+        "--spec",
+        action="store_true",
+        help="P10 AdaptiveSpec: adaptive lossy speculative decoding "
+        "— margin rule + adaptive draft tree vs fixed-tree "
+        "(EAGLE-like) vs target-only, on a deterministic toy "
+        "decoder (seeded trigram target + bigram draft, "
+        "64-token vocab, no real model, no EAGLE-3, no "
+        "GSM8K/MATH/HumanEval)",
     )
     pe.add_argument(
         "--corecall",
