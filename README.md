@@ -134,6 +134,17 @@ query ──┬── BM25 (FTS5) ────────────┐
   guidelines file with support + provenance on every guideline,
   and full-vs-retrieved-subset injection A/B on the fixed P21
   set through the P23 skill agent.
+- `hybrid_retriever/lora.py` — P6: Route to Remember weight
+  memory (`build_fact_index` / `build_distillation_examples` /
+  `train_student` / `save_student` / `load_student` / `is_stale`
+  / `teacher_answer` / `audit_answer` / `answer_student` /
+  `run_lora_eval` / `run_planted_conflict`). CPU stand-in for a
+  LoRA (stated in the module docstring): a NumPy prototype
+  classifier over the ONNX MiniLM embeddings, truncated by SVD
+  to a low-rank adapter, saved as a versioned `.npz` artifact
+  per project, with verify-then-regenerate against the text
+  store (vector-leg audit, gated or always) and a planted-
+  conflict demo proving a stale weight gets caught.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -322,7 +333,7 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 183 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 213 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
@@ -363,6 +374,15 @@ candidate-id restriction of the graph leg, clusters, the
 reconsolidation job (promote / prune / 2-hop closure / dry-run
 writes nothing / near-duplicate merge inside a cluster), and the
 full co-recall eval smoke test on the synthetic corpus.
+P6 adds: the fact index (48 facts, traps name no fact,
+distillation pairs are keyword questions + teacher answer texts
+only), closed-form prototype training (deterministic, rank and
+param count), the versioned `.npz` artifact (save/load round-trip
+preserves predictions, per-project filenames), staleness on a
+fact-set hash change, context-free answering (0 records read),
+the vector-leg audit, and the planted-conflict catch (superseded
+old fact, regenerated from the corrected records) plus the
+three-arm eval's read-cost ordering.
 
 ## P3 — Lychee-style lazy segment consolidation
 
@@ -778,6 +798,172 @@ with synthetic support, testing that the gate can say no.
   granularity: any future miner that proposes a guideline —
   including one mined from live traffic instead of the seeded
   set — goes through the same three conditions before it ships.
+
+## P6 — LoRA weight memory (Route to Remember)
+
+`lora.py` implements Route to Remember (arXiv:2611.05636, NeurIPS
+2026 Workshop PALM) on top of the P1 store: memory baked into
+weights instead of text — distil a user's facts into a per-user
+LoRA, so query-time read cost collapses to near zero — plus
+verify-then-regenerate (the LoRA answers first; the answer is
+audited against the text store; only conflicts are regenerated
+with retrieved evidence). Reproduce with `hr eval --lora`;
+distil a versioned artifact with `hr lora --project synthetic
+--version 1 [--out lora_synthetic_v1.npz]`.
+
+Substitutions, stated plainly: this VM has no torch, no GPU,
+1.5 shared CPUs and ~6 GB RAM, and PyTorch wheel downloads
+stall here, so **no real LoRA / Qwen training ran and none is
+pretended**. The student is a small NumPy prototype classifier
+over the existing ONNX MiniLM embeddings (the frozen base): one
+prototype per fact — the centroid of the teacher's answer
+embeddings for that fact — compressed to a low-rank adapter by
+truncated SVD (`logits = x @ A @ B`, A 384×rank, B rank×48).
+The teacher is the retrieval-grounded answerer (P1 hybrid recall
+→ answer from retrieved records); its answers are the retrieved
+record texts themselves. The OPSD recipe's *structure* is copied
+(distil the teacher's answers into a context-free student), not
+its generative training loop, and the paper's OPSD-vs-SFT gap
+(59.9% vs 36.9%) is not reproduced — there is no SFT baseline
+on a generative student here, so no such claim is made.
+
+**Phase 1 — OPSD (structure).** Training pairs per fact: the
+keyword question + the 3 teacher answer texts (the gold record
+texts), all labelled with the fact — 192 examples for 48 facts.
+Rank 32 was chosen by sweep on the held-out set: rank 8 →
+0.304, 16 → 0.554, 24 → 0.661, 32 → 0.696 (full prototype
+accuracy), 13,824 adapter params vs 18,432 for the full
+prototype matrix. Training accuracy is 1.000 (the prototypes
+fit the training phrasing exactly); the eval measures transfer
+to paraphrase phrasing the student never saw.
+
+**Phase 2 — Verify-then-regenerate.** The student answers
+context-free (0 records read). The audit consults the text store
+with the vector leg only — the strongest leg on this corpus per
+the P1 finding (bare cosine any-hit@5 0.875 vs hybrid 0.589 on
+the TRACE split) — top 5: if the student's fact appears among
+the audited facts the answer stands, otherwise it regenerates
+from the first audited record naming a known fact. Two audit
+policies: `always` (5 records/query) and `gated` (default:
+audit only when the student's confidence falls below the
+artifact's threshold, the 5th percentile of training
+confidences, stored in the artifact).
+
+**Phase 3 — Serve per project.** `save_student` /
+`load_student` round-trip a versioned `.npz` artifact
+(`lora_<project>_v<version>.npz`: factors + config + the
+fact-set hash it was distilled from); loading a different
+artifact is the per-project swap. `is_stale` compares the
+artifact's fact-set hash against the live store's, so a
+supersede / correction invalidates the cache explicitly.
+
+### Measured results — HaluMem-style three-arm eval (synthetic)
+
+Train on the 48 keyword questions (+ teacher answer texts),
+eval on the 56 held-out paraphrase + trap questions.
+Embedder: `onnx-all-MiniLM-L6-v2`. Read cost is records (and
+tokens, `ceil(len/4)`) read per query. Reproduce with
+`hr eval --lora`.
+
+| arm | accuracy | correct | records/query | tokens/query | regenerated |
+|---|---|---|---|---|---|
+| retrieval (hybrid top-1) | 0.357 | 20/56 | 10.00 | 169.1 | 0 |
+| student alone | 0.696 | 39/56 | 0.00 | 0.0 | 0 |
+| student+verify (always) | **0.714** | 40/56 | 5.00 | 86.1 | 4 |
+| student+verify (gated) | **0.714** | 40/56 | **2.23** | 38.3 | 3 |
+
+By kind (student+verify, either policy): paraphrase 0.750
+(36/48), trap 0.500 (4/8). Retrieval alone: paraphrase 0.417
+(20/48), trap 0.000 (0/8) — it answers with the top hybrid
+record, and on this corpus the top hybrid record is a
+same-person distractor or a trap record more often than not.
+
+**Honest reading — the plan's literal bar is met, narrowly.**
+Student+verify beats retrieval alone (0.714 vs 0.357) at a
+quarter of the read cost gated (2.23 vs 10 records/query) —
+but most of that win is the student alone (0.696 at zero read
+cost), and the verify step adds exactly one question (+1.8pp):
+of 4 always-audit regenerations, 1 was correct and 3 were
+wrong-to-wrong; the gated policy regenerated 3 with the same
+net +1. The verify step is doing what it should (it never
+overturned a correct student answer in the always arm — 0 lost
+— and the gated arm lost none either), but on this corpus the
+audit evidence is barely stronger than the student: the vector
+leg's top-5 contains the gold fact 87.5% of the time, yet the
+student is already right 69.6% of the time, so there is little
+headroom left for verification to add. And like P23/P5, the
+result is circular by construction in one place: the training
+labels are the gold facts of the teacher's evidence, so the
+student is supervised on the facts it is tested on — what the
+eval proves is the *transfer* (keyword phrasing → paraphrase
+phrasing, held out) and the machinery (distil → version →
+serve → verify → regenerate), not that a LoRA trained this way
+would beat retrieval on unseen facts. The claim that survives
+is narrower: weight memory can answer these facts at zero read
+cost, and the verify step can catch a stale weight.
+
+### Planted conflict — the verify step catches it
+
+The student memorised Nina's old personal best ("three hours
+twelve minutes, set in Berlin"). The text store is then
+corrected: the 3 old records are superseded (never deleted)
+and corrected records are added ("two hours fifty-eight
+minutes, set in Berlin"). The artifact is stale by its
+fact-set hash, so the serve path audits always:
+
+| check | result |
+|---|---|
+| student (context-free) | `nina-marathon`, confidence 0.792 (threshold 0.637) |
+| artifact stale after correction | True |
+| gated policy would have audited | **False** — the confident stale answer skips the gated audit |
+| verify (always audit) | conflict caught, regenerated |
+| final answer | `nina-marathon-corrected` — "…two hours fifty-eight minutes, set in Berlin." — correct |
+
+The gated hole is the finding, not a footnote: confidence
+cannot detect staleness — a correction the student never saw
+leaves it confident *and* wrong. That is why a correction
+must flip the serve policy to always-audit (or trigger
+re-distillation) via the fact-set hash, instead of relying on
+the student's confidence. The demo pins both halves: the
+always-audit catch, and `gated_would_audit == False`.
+
+### Regressions (re-run after P6)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 29,514 tokens saved, faithfulness
+  0.486, 0 violations).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+- P20 verify-by-doing lift +0.333 (8/24 vs 0/24, --tasks 24).
+- P21 tobench grounded 12/12, sloppy 1/12.
+- P22 `hr durable demo` kill/resume STATUS SUCCESS, zero violations.
+- P23 `hr eval --gepa --nights 4` 1→4→7→10→12/12, 4 edits kept,
+  1 rejected.
+- P4 `hr eval --corecall` hybrid+corecall any-hit@5 0.625,
+  R@10 0.476 (vs P1 hybrid 0.589/0.393).
+- P5 `hr eval --lessons` none 1/12, retrieved k=1 12/12, full 12/12,
+  planted backfire guideline rejected.
+
+## What P6 hooks into (P7+)
+
+- `Student` is the weight-memory counterpart to P5's text
+  guidelines: the same fact set can be served as weights
+  (zero read cost, stale-able) or as text (always current,
+  always read). The fact-set hash is the versioning primitive
+  any later plan can reuse — a correction that changes the hash
+  is the trigger for re-distillation, and the gated audit is
+  the cheap check that runs between distillations.
+- `answer_student`'s verify step is the P20 habit at answer
+  granularity: check the claimed fact against retrieved records
+  (recomputation, not trust), and regenerate only on conflict.
 
 ## P18 — CWL structured context eviction
 

@@ -164,6 +164,29 @@ def cmd_eval(args) -> None:
             write_guidelines(args.lessons_out, result["guidelines"])
             print("guidelines written to %s" % args.lessons_out)
         return
+    if args.lora:
+        from .lora import (
+            print_lora_report,
+            print_planted_conflict_report,
+            run_lora_eval,
+            run_planted_conflict,
+        )
+
+        result = run_lora_eval(
+            os.path.join("eval_data", "synthetic_corpus.jsonl"),
+            os.path.join("eval_data", "synthetic_queries.json"),
+            embedder=embedder,
+            rank=args.lora_rank,
+        )
+        print_lora_report(result)
+        conflict = run_planted_conflict(
+            os.path.join("eval_data", "synthetic_corpus.jsonl"),
+            os.path.join("eval_data", "synthetic_queries.json"),
+            embedder=embedder,
+            rank=args.lora_rank,
+        )
+        print_planted_conflict_report(conflict)
+        return
     if args.trace:
         result = run_synthetic_trace(
             os.path.join("eval_data", "synthetic_corpus.jsonl"),
@@ -483,6 +506,62 @@ def cmd_graph(args) -> None:
     store.close()
 
 
+def cmd_lora(args) -> None:
+    """P6: distil a versioned LoRA artifact from the synthetic corpus
+    (the per-project swap: a different --project/--version loads a
+    different artifact with ``load_student``)."""
+    import tempfile
+
+    from .eval import load_synthetic
+    from .lora import (
+        artifact_path,
+        build_distillation_examples,
+        build_fact_index,
+        save_student,
+        train_student,
+    )
+
+    embedder = get_embedder()
+    records, queries = load_synthetic(
+        os.path.join("eval_data", "synthetic_corpus.jsonl"),
+        os.path.join("eval_data", "synthetic_queries.json"),
+    )
+    tmp = tempfile.mkdtemp(prefix="hr-lora-train-")
+    store = Store(os.path.join(tmp, "lora.db"), embedder=embedder)
+    rids = store.add_texts(
+        [r["text"] for r in records], type_="fact", embedder=embedder
+    )
+    index = build_fact_index(records, queries, rids)
+    texts, labels = build_distillation_examples(index, queries)
+    student = train_student(
+        texts,
+        labels,
+        embedder,
+        rank=args.rank,
+        project=args.project,
+        version=args.version,
+        fact_set_hash=index.fact_set_hash(),
+    )
+    out = args.out or artifact_path(args.project, args.version, ".")
+    save_student(student, out)
+    print(
+        "lora %s v%d: %d facts, %d train examples, rank=%d, "
+        "%d params, train acc=%.3f, audit threshold=%.3f -> %s"
+        % (
+            student.project,
+            student.version,
+            len(student.fact_ids),
+            student.n_train,
+            student.rank,
+            student.n_params,
+            student.train_accuracy,
+            student.audit_threshold,
+            out,
+        )
+    )
+    store.close()
+
+
 def cmd_lessons(args) -> None:
     """P5: run the lessons-miner demo and optionally persist the
     mined guidelines file (a natural .larp import)."""
@@ -610,6 +689,17 @@ def main() -> None:
     pe.add_argument(
         "--lessons-out", default=None,
         help="write the mined guidelines file here for --lessons",
+    )
+    pe.add_argument(
+        "--lora",
+        action="store_true",
+        help="P6 LoRA weight memory: HaluMem-style three-arm eval "
+        "(retrieval / student / student+verify) plus the planted-"
+        "conflict demo on the synthetic corpus",
+    )
+    pe.add_argument(
+        "--lora-rank", type=int, default=32,
+        help="adapter rank for --lora (default 32)",
     )
     pe.add_argument(
         "--corecall",
@@ -760,21 +850,35 @@ def main() -> None:
     pg.set_defaults(func=cmd_graph)
 
     pl = sub.add_parser(
+        "lora",
+        help="P6: distil a versioned LoRA artifact from the synthetic "
+        "corpus (per-project swap via load_student)",
+    )
+    pl.add_argument("--project", default="synthetic")
+    pl.add_argument("--version", type=int, default=1)
+    pl.add_argument("--rank", type=int, default=32)
+    pl.add_argument(
+        "--out", default=None,
+        help="artifact path (default: lora_<project>_v<version>.npz)",
+    )
+    pl.set_defaults(func=cmd_lora)
+
+    pl2 = sub.add_parser(
         "lessons",
         help="P5: mine lessons from the no-rule run, merge into "
         "guidelines, A/B none / retrieved / full injection, trial "
         "the planted backfire guideline through the gate",
     )
-    pl.add_argument(
+    pl2.add_argument(
         "--k", type=int, default=2,
         help="guidelines retrieved per task in the retrieved arm "
         "(default 2)",
     )
-    pl.add_argument(
+    pl2.add_argument(
         "--out", default=None,
         help="write the mined guidelines file here",
     )
-    pl.set_defaults(func=cmd_lessons)
+    pl2.set_defaults(func=cmd_lessons)
 
     args = p.parse_args()
     args.func(args)
