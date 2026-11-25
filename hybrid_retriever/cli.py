@@ -188,6 +188,15 @@ def cmd_eval(args) -> None:
         result = run_spec_eval()
         print_spec_report(result)
         return
+    if args.spec_scratch:
+        from .specdec_scratch import (
+            print_scratch_report,
+            run_scratch_eval,
+        )
+
+        result = run_scratch_eval()
+        print_scratch_report(result)
+        return
     if args.lora:
         from .lora import (
             print_lora_report,
@@ -760,6 +769,15 @@ def main() -> None:
         "decoder (seeded trigram target + bigram draft, "
         "64-token vocab, no real model, no EAGLE-3, no "
         "GSM8K/MATH/HumanEval)",
+    )
+    pe.add_argument(
+        "--spec-scratch",
+        action="store_true",
+        help="P11 from-scratch lossless speculative decoding "
+        "— chain + tree verification written from scratch, "
+        "chi^2 distribution equivalence over 9200 tokens, "
+        "wall-clock at K=6 across configs (toy decoder, "
+        "NumPy, no real model, no GPU)",
     )
     pe.add_argument(
         "--corecall",

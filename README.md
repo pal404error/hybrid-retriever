@@ -60,6 +60,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # P10 AdaptiveSpec (toy decoder, no real model):
 .venv/bin/python -m hybrid_retriever.cli eval --spec
+
+# P11 from-scratch lossless speculative decoding (toy decoder, no real model):
+.venv/bin/python -m hybrid_retriever.cli eval --spec-scratch
 ```
 
 ## Architecture
@@ -180,6 +183,16 @@ query ──┬── BM25 (FTS5) ────────────┐
   NumPy only, deterministic, no torch, no model — synthetic
   correlated BF16-baseline KV only (P8's profiles, reused),
   stated in the module docstring and the P9 section below.
+- `hybrid_retriever/specdec_scratch.py` — P11: from-scratch
+  lossless speculative decoding (`speculative_round` /
+  `build_sampled_tree` / `verify_tree_lossless` /
+  `generate_lossless` / `sample_target_only` /
+  `chi2_homogeneity` / `chi2_sf` / `run_chi2_eval` /
+  `run_benchmark` / `run_scratch_eval`). NumPy only,
+  deterministic, no torch, no GPU — the loop is written from
+  scratch (it imports only the toy LM *distributions* from
+  P10's `specdec.py`, never its speculative loop), stated in
+  the module docstring and the P11 section below.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -368,7 +381,7 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 262 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 307 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
@@ -461,6 +474,22 @@ scalar k3v2), the fidelity eval (context length actually
 changes the task, determinism across two runs), and the
 done condition pinned as measured (False — E8 wins 0
 settings vs scalar k3v2 on this synthetic data).
+P11 adds: the hand-rolled χ² survival function (known
+95th percentiles), χ² homogeneity on a known-identical vs
+a known-different pair, the adjusted-distribution resample
+(support + empirical distribution), rejection-sampling
+correctness (empirical frequencies match the target, and a
+naive retry-after-rejection is provably NOT the target),
+the chain loop (length, determinism, K=6 accounting, one
+batched forward per round, >1 tok/fwd, first-token
+distribution match on random contexts), the sampled tree
+(shape, contexts, sibling uniqueness, width-1-is-a-chain,
+lossless walk, first-token distribution match), the cost
+model (forward counting, checksum, raw mode does zero
+simulated work), the from-scratch pin (no speculative-loop
+import from specdec), and eval determinism (χ² statistic
+and long-gen TV identical across runs, benchmark
+accounting on all seven configs).
 
 ## P3 — Lychee-style lazy segment consolidation
 
@@ -1783,6 +1812,247 @@ the eval ran, and the numbers above are as measured.
   answer harness: any later speculative variant can
   score answer agreement on the same 24 prompts without
   touching a real benchmark.
+
+## P11 — From-scratch speculative decoding (device-agnostic)
+
+`specdec_scratch.py` implements "Lossless but Not Free"
+(arXiv:2607.17283) from scratch: a draft + target loop with
+tree verification, a χ² check that the output distribution
+matches the target alone, and a wall-clock benchmark at K=6.
+Reproduce with `hr eval --spec-scratch`.
+
+Substitutions, stated plainly: this VM has no torch, no GPU,
+no CUDA/MPS, no real LM and no model download, so **no real
+model ran, no GPU ran, and none is pretended**. CPU-only,
+pure NumPy, deterministic toy distributions: the target and
+draft *distributions* are P10's (seeded trigram target +
+arithmetic head, bigram draft, 64-token vocab, same fixed
+synthetic text) — imported from `specdec.py` as
+distributions only. The speculative LOOP is written from
+scratch in this module: it does not import
+`generate_speculative`, `verify_tree`, `build_draft_tree`,
+`margin_accept` or either policy from `specdec` (pinned by
+test), and unlike P10 it uses NO margin rule at all.
+
+**The algorithm (lossless speculative sampling).** Per
+round the draft proposes K=6 tokens sampled from its
+distribution q; the target verifies them in ONE batched
+forward; each draft token x is accepted with probability
+min(1, p(x)/q(x)) where p is the target distribution; the
+first rejection is repaired by resampling from the ADJUSTED
+distribution norm(max(0, p − q)); if all K are accepted a
+bonus token is sampled from p. The output token at every
+position is therefore distributed EXACTLY as the target's —
+that is the "lossless" part, and it is what the χ² test
+checks. (P10's margin rule cannot make that claim: it
+accepts whenever p(x) is within a margin of the top-1
+probability, which shifts the output distribution toward
+the draft.) The cost model is P10's, re-implemented here
+from scratch so its size can vary per config: one fixed
+block of elementwise NumPy work per batched target forward
+(8 × 384×384 float32 at the default size), independent of
+batch size, plus a tiny per-node op; draft forwards are
+cheap bigram lookups unless a config charges simulated
+draft work.
+
+**Tree verification, and its honest limit.** The tree is
+built by SAMPLING `width` children per node (not top-k) and
+verified in one batched forward over all its nodes, but the
+walk follows ONE child per position (the first sampled
+child) and applies the lossless rejection trial to it; on
+rejection it resamples from the adjusted distribution and
+stops, discarding the subtree. That single-trial rule is
+what keeps the output exactly equal to the target's: trying
+a second sibling after a rejection would NOT be lossless —
+with i.i.d. proposals the first-accepted token would be
+distributed as min(p, q)/Σmin(p, q), not p (pinned by test:
+for p=[0.5,0.3,0.2], q=[0.2,0.3,0.5] the retry rule yields
+[0.286,0.429,0.286], far from p). So under the lossless
+rule extra tree width buys no accepted length: it only
+costs draft sampling plus a larger batched forward. The
+benchmark measures that cost instead of assuming the tree
+helps — and it is the worst number in the table below.
+
+**Phase 2 — χ² verification (the design matters).** The
+test uses 9,200 INDEPENDENT contexts per arm (two
+independently drawn context sets, same distribution), one
+token per context: the speculative token is the first token
+of a fresh K=6 round, the target token is a direct sample
+from p. Independent contexts are what the homogeneity test
+assumes — the two count vectors are then independent
+multinomial mixtures. Tokens inside one long generation
+would NOT do: they are autocorrelated (a trigram chain),
+which inflates the statistic — the long-generation
+comparison below (χ² 639.19 on the same 9,200 tokens) shows
+exactly that failure, so it is reported as descriptive
+only, never as the test. A target-vs-target control with
+the same design lands in the nominal range (statistics
+56–68 across seeds), which is what validates the setup;
+categories with expected count < 5 under H0 are pooled
+into one "other" bucket (none needed pooling at n=9,200:
+min expected count 5.0). The χ² survival function is
+implemented by hand from the regularised incomplete gamma
+function (no scipy on this VM; pinned against the known
+95th percentiles: χ²₁=3.841459, χ²₂=5.991465,
+χ²₆₃≈82.5 → p=0.05).
+
+### Measured results — χ² (9,200 tokens per arm, K=6)
+
+| statistic | df | p-value | α | verdict |
+|---|---|---|---|---|
+| 45.71 | 63 | 0.9504 | 0.05 | **PASS** |
+
+Long-generation descriptive check (40 prompts × 230 tokens
+per arm): total-variation distance 0.1080 between the
+speculative and target-only unigram distributions. That
+looks large until the control is run: target-only vs
+target-only with different seeds gives TV 0.092–0.093 on
+the same setup — the toy trigram chain mixes slowly, so
+two 40-chain samples differ by ~0.1 whatever the decoder
+is. The χ² above, not the long-gen distance, is the
+distribution-equivalence evidence.
+
+### Measured results — wall-clock at K=6 (40 prompts × 24 tokens, mean over 3 repeats)
+
+Acceptance rate 0.570, 2.23 tokens per target forward
+(chain) / 2.22 (tree) on every config — the deterministic
+columns are identical on a second full run, as is the χ²
+statistic (45.71, df 63, p=0.9504). Speedups are spec
+tok/s ÷ target-only tok/s WITHIN each config (same
+simulated cost on both sides).
+
+| config | spec tok/s | base tok/s | tok/fwd | speedup |
+|---|---|---|---|---|
+| A target ×1, cheap draft, chain | 2032.4 | 1201.6 | 2.23 | **1.69×** |
+| B target ×4, cheap draft, chain | 667.3 | 334.7 | 2.23 | **1.99×** |
+| C target ×0.25, cheap draft, chain | 4486.7 | 4221.0 | 2.23 | 1.06× |
+| D target ×1, expensive draft, chain | 1455.7 | 1223.1 | 2.23 | 1.19× |
+| E target ×1, cheap draft, tree w=2 | 323.0 | 1332.1 | 2.22 | 0.24× |
+| F target ×4, cheap draft, tree w=2 | 243.5 | 321.5 | 2.22 | 0.76× |
+| G RAW CPU, no simulated cost, chain | 9080.3 | 39010.5 | 2.23 | 0.23× |
+
+A second full run confirmed the ordering (A 1.63×, B 2.08×,
+C 1.06×, D 1.16×, E 0.27×, F 0.76×, G 0.23×).
+
+**Done condition MET.** χ² passes (p=0.9504) and two
+configs clear 1.6× (A 1.69×, B 1.99×) — the plan's bar,
+with the 1.6× coming from the configs where the
+target-forward cost dominates, exactly as the paper's
+title says: lossless, but not free.
+
+### When it does NOT pay (the note the plan asks for)
+
+Speculative decoding pays only when the target forward is
+expensive AND verification is genuinely batch-parallel AND
+the draft is cheap — all three at once. This build shows
+each leg failing separately:
+
+1. **Cheap target (config C, 1.06×).** When one target
+   forward costs only 2 simulated work rounds, saving
+   forwards barely matters: 2.23 tok/fwd buys almost
+   nothing once the draft's 6 lookups + 7 distribution
+   computations per round are counted. The latency gap has
+   to be real — a target only ~4× the draft's per-token
+   cost is not enough.
+2. **Expensive draft (config D, 1.19×).** Charging the
+   draft 6 rounds of simulated work per step — a draft
+   model that is not much cheaper than the target — eats
+   most of the win (1.69× → 1.19× at the same target
+   cost). This is the P12 premise in miniature: for small
+   targets, drafting overhead, not draft quality, is the
+   bottleneck.
+3. **Tree width (configs E/F, 0.24× / 0.76×).** The worst
+   numbers in the table, and the most instructive. Under
+   the lossless rule only one candidate per position may
+   be tried, so a width-2, depth-6 tree samples up to 127
+   draft tokens per round to walk a 6-token path — the
+   accepted length is unchanged (2.22 vs 2.23 tok/fwd)
+   while the draft cost explodes. Tree verification pays
+   only under a lossy rule (P10's margin rule, where a
+   second candidate can rescue a position) or with a
+   verification rule that can use siblings without biasing
+   the output; under strict lossless sampling, width is
+   pure overhead.
+4. **No batch parallelism (config G, 0.23×).** With the
+   simulated cost switched off, each node's distribution
+   is a separate Python n-gram computation — verification
+   is NOT batch-parallel, it is 7 sequential distribution
+   computations per round — and the speculative decoder
+   runs at a quarter of target-only speed (9,080 vs
+   39,010 tok/s) despite 2.23 tok/fwd. This is the config
+   that most resembles a naive CPU implementation, and it
+   is a 4× slowdown. The 1.6×+ wins above exist ONLY
+   because the cost model assumes a batched forward costs
+   ~one forward however many nodes it covers — i.e. a
+   real accelerator, or a target whose cost is dominated
+   by weight loading rather than per-token compute. On
+   hardware where verification is not batch-parallel,
+   speculative decoding does not pay, however good the
+   acceptance rate is.
+
+The portable number is 2.23 tokens per target forward at
+acceptance 0.570; whether that turns into wall-clock
+depends entirely on the three conditions above.
+
+### Regressions (re-run after P11)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 29,514 tokens saved, faithfulness
+  0.486, 0 violations).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+- P20 verify-by-doing lift +0.333 (8/24 vs 0/24, --tasks 24).
+- P21 tobench grounded 12/12, sloppy 1/12.
+- P22 `hr durable demo` kill/resume STATUS SUCCESS, zero violations.
+- P23 `hr eval --gepa --nights 4` 1→4→7→10→12/12, 4 edits kept,
+  1 rejected.
+- P4 `hr eval --corecall` hybrid+corecall any-hit@5 0.625,
+  R@10 0.476 (vs P1 hybrid 0.589/0.393).
+- P5 `hr eval --lessons` none 1/12, retrieved k=1 12/12, full 12/12,
+  planted backfire guideline rejected.
+- P6 `hr eval --lora` retrieval 0.357, student alone 0.696,
+  student+verify gated 0.714 at 2.23 records/query, planted
+  conflict caught.
+- P7 `hr eval --gaac` 1.455× / 1.600× lossless, bit-exact,
+  attention bit-identical, on-the-fly 6.0× less peak memory.
+- P8 `hr eval --kvcache` 14.25× / 14.29×, attended-pos top-1
+  0.986/0.964, vocab top-1 0.800/0.734, restart continuation
+  identical, 20× target NOT met.
+- P9 `hr eval --e8` E8 k2v2 beats scalar k3v2 in 0/4 settings
+  and scalar k2v2 in 0/4, table trick max abs diff ≤7.5e-09,
+  done condition NOT met.
+- P10 `hr eval --spec` fixed 2580.0 tok/s, 2.84 tok/fwd,
+  0.996 agree; adaptive 2527.6 tok/s, 2.87 tok/fwd, 0.997
+  agree; done NOT met (adaptive loses wall-clock −2.0%).
+
+## What P11 hooks into (P12+)
+
+- The lossless loop is the correctness baseline P12's
+  retrieval drafter has to match: a prompt-lookup drafter
+  that proposes tokens from retrieved text can reuse the
+  same rejection-sampling verification, and the χ² harness
+  here is the test that proves its output still equals the
+  target's distribution — a drafter that only looks fast
+  but shifts the distribution fails this test.
+- The three-way cost split (target-forward cost, draft
+  cost, batch-parallelism) is the measurement P12 needs:
+  its claim is that retrieval drafting wins on overhead,
+  and configs C/D/G above are the baselines that claim
+  has to beat.
+- The tree-width finding constrains P13 (DISCO): shipping
+  a tree across a wire only makes sense if the receiving
+  end can verify siblings usefully; under lossless
+  sampling it cannot, so a distributed design inherits
+  the same width-is-overhead result unless its
+  verification rule differs.
 
 ## P18 — CWL structured context eviction
 
