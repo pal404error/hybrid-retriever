@@ -176,6 +176,12 @@ def cmd_eval(args) -> None:
         result = run_kvcache_eval()
         print_kvcache_report(result)
         return
+    if args.e8:
+        from .e8 import print_e8_report, run_e8_eval
+
+        result = run_e8_eval()
+        print_e8_report(result)
+        return
     if args.lora:
         from .lora import (
             print_lora_report,
@@ -729,6 +735,15 @@ def main() -> None:
         "synthetic correlated BF16-baseline KV, plus the "
         "multi-turn restart demo (no real model, no real "
         "checkpoints)",
+    )
+    pe.add_argument(
+        "--e8",
+        action="store_true",
+        help="P9 E8 lattice key quantisation (k2v2): E8 k2v2 vs "
+        "scalar k2v2 vs scalar k3v2 on attention fidelity over "
+        "synthetic correlated BF16-baseline KV, plus the "
+        "table-based scoring check (no real model, no "
+        "perplexity)",
     )
     pe.add_argument(
         "--corecall",

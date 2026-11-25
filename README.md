@@ -54,6 +54,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # P8 KV-cache snapshot store with transform coding (synthetic KV):
 .venv/bin/python -m hybrid_retriever.cli eval --kvcache
+
+# P9 E8 lattice key quantisation (k2v2) (synthetic KV, no real model):
+.venv/bin/python -m hybrid_retriever.cli eval --e8
 ```
 
 ## Architecture
@@ -166,6 +169,14 @@ query ──┬── BM25 (FTS5) ────────────┐
   deterministic, no torch, no model — synthetic correlated
   BF16-baseline KV only, stated in the module docstring and
   the P8 section below.
+- `hybrid_retriever/e8.py` — P9: E8 lattice key quantisation
+  (`build_codebook` / `get_codebook` / `nearest_e8` /
+  `quantise_keys_e8` / `dequantise_keys_e8` /
+  `quantise_scalar` / `dequantise_scalar` /
+  `attention_table` / `fidelity_eval` / `run_e8_eval`).
+  NumPy only, deterministic, no torch, no model — synthetic
+  correlated BF16-baseline KV only (P8's profiles, reused),
+  stated in the module docstring and the P9 section below.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -354,7 +365,7 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 246 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 262 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
@@ -430,6 +441,23 @@ the same coder from disk; snapshots still load if the cache
 is deleted), and the restart demo (bounded error pinned;
 argmax identity reported as measured, with the gap/error
 diagnostic that explains a flip).
+P9 adds: the E8 codebook (56,881 points, every codeword on
+the lattice with even coordinate sum, 240 minimal vectors,
+half-split reconstruction, lookup round-trip, out-of-range
+rejection), the lattice decoder (exact vs brute force on
+small-norm vectors — distances, not points, because the
+nearest point need not be unique — identity on codewords,
+parity cases), quantise/dequantise round-trips (E8 K-MSE
+beats scalar k2 and trails scalar k3 on the fixed slice,
+scalar error monotone in bits, zero handled per quantiser,
+prefix slicing consistent, the minimal-vector fallback
+counted and under 5%), table-scored attention equivalent
+to the dequantised path (max abs diff < 1e-5), the stored-
+size accounting (E8 k2v2 == scalar k2v2 bytes, both above
+scalar k3v2), the fidelity eval (context length actually
+changes the task, determinism across two runs), and the
+done condition pinned as measured (False — E8 wins 0
+settings vs scalar k3v2 on this synthetic data).
 
 ## P3 — Lychee-style lazy segment consolidation
 
@@ -1353,6 +1381,242 @@ re-prefill) with the measured numbers attached, not that
   a lossier codec has to beat: a codec that cannot hold
   attended-position top-1 ≥ 0.95 at its claimed ratio has not
   earned the ratio, whatever its bits/code says.
+
+## P9 — E8 lattice key quantisation (k2v2)
+
+`e8.py` implements E8 Lattice Key Quantisation
+(arXiv:2610.15384) on top of P8's synthetic KV profiles:
+2-bit keys + 2-bit values that keep near-baseline
+long-context quality by exploiting cross-dimension
+correlation on the E8 lattice, with the table-based
+scoring trick that avoids dequantising keys during
+attention. Reproduce with `hr eval --e8`.
+
+Substitutions, stated plainly: this VM has no torch, no GPU,
+and no real model, so **no real model ran, no perplexity was
+computed, and none is pretended**. The quantiser runs in pure
+NumPy on SYNTHETIC BF16-baseline KV tensors — P8's two fixed
+profiles (same shapes, seeds, and cross-channel-correlated
+generation), reused, not redefined — and the metric is
+ATTENTION FIDELITY vs the unquantised baseline on P8's
+deterministic attention task (attention-output error and
+top-1 agreement), not perplexity. There is no Triton/Metal
+kernel: the table trick is a NumPy implementation of the
+paper's idea, verified against the dequantise path.
+
+**Correction to the brief.** The task brief suggested "256
+codewords per 8-dim block". That is 1 bit/dim, not 2. The
+paper's construction is 2 bits/dim payload = 16 bits per
+8-dim block = 65,536 codewords per block, 2.25 bits/dim
+effective including norm metadata. This module implements
+the paper's accounting: the finite codebook is ALL E8 points
+with squared norm ≤ 10 — 56,881 codewords (the E8 theta
+series: 1 + 240 + 2160 + 6720 + 17520 + 30240), every one
+fitting a 16-bit index; the 8,655 unused indices are never
+emitted.
+
+**Construction.** E8 = {x in Z^8 or (Z + 1/2)^8 : sum(x)
+even}; in doubled coordinates u = 2x, all u_i even or all
+u_i odd, sum(u) divisible by 4, sum(u^2) ≤ 40. The codebook
+is built once, lazily, by pruned enumeration in doubled
+coordinates (even and odd branches separately), sorted
+lexicographically. Nearest-codeword assignment is NOT a
+brute-force search over 56,881 codewords: it is the standard
+E8 lattice decoder — round to the nearest integer vector and
+to the nearest half-integer vector, fix each candidate's
+parity by moving the coordinate with the largest rounding
+error by ±1 toward the input, keep the closer candidate —
+exact for the infinite lattice (verified against brute force
+in the tests; the comparison is on distances, because the
+nearest point need not be unique).
+
+**Scale / norm metadata (the control variable).** Identical
+for every arm, so fidelity differences are the quantiser
+geometry, not the metadata budget: one FP16 RMS scale per
+key/value vector (per token, per head) plus one 2-bit norm
+code per 8-dim block (log-spaced multipliers 2^-1/2,
+2^-1/6, 2^1/6, 2^1/2). Per block ALL FOUR multipliers are
+tried and the one with the smallest reconstruction error is
+kept; the norm code stores the multiplier actually used.
+Effective rates: E8 keys 2.375 bits/dim (2 index + 0.125
+vector scale + 0.25 norm code), scalar k2 keys the same,
+scalar k3 keys 3.375, values (scalar 2-bit in every arm —
+the lattice is a key-side primitive and the values are
+shared, so the arms differ only in the keys) 2.375.
+Combined KV: E8 k2v2 4.75 bits/dim vs FP16 32 → 6.74×
+(d=128) / 6.40× (d=64); scalar k3v2 5.75 bits/dim →
+5.57× / 5.33×. E8 k2v2 is ~20% smaller than scalar k3v2,
+as in the paper, and the ratios are computed from the
+stored bytes, not asserted.
+
+**Overload rule.** A decoded lattice point with ||z||^2 > 10
+is outside the finite codebook. The multiplier search makes
+this rare, but for the blocks where the chosen multiplier
+still decodes outside (1.93% of blocks on the llama profile,
+1.26% on the small profile), the block falls back to the
+minimal E8 vector (||z||^2 == 2, one of 240) closest in
+direction to the block — direction preserved, about half
+the magnitude, still a 16-bit codeword index, no extra
+metadata — and the fallback is counted in the eval output.
+There is no radial clipping of the input: clipping would
+change the direction the attention score uses.
+
+**Table-based scoring.** Scores are q · k̂ = Σ_b s · m_b ·
+(q_b · z_b). Each codeword splits into two 4-dim halves;
+for a query block, two lookup tables hold the dot products
+of the query half with every distinct half-codeword (1,081
+per half), built by one small matmul per half, and a key is
+scored by two table lookups plus one add per block. The key
+vector is never materialised. Equivalence with the
+dequantised path is verified per setting (max abs diff
+≤ 7.5e-09, all four settings).
+
+**One eval-harness fix, stated plainly.** P8's
+`reasoning_eval` truncates BOTH queries and keys to
+n_tokens, so a 2048-key run scores exactly like a 64-key
+run — context length cannot matter in it. P9's
+`fidelity_eval` keeps the queries at the leading 64 key
+rows but attends over the whole context prefix, so a longer
+context really is a harder task (more distractor keys
+competing for the argmax). The P8 numbers are untouched
+(`reasoning_eval` is not modified); P9 just does not use it
+for the context comparison.
+
+### Measured results — E8 k2v2 vs scalar k2v2 vs scalar k3v2 (synthetic KV)
+
+Reproduce with `hr eval --e8` (~18 s). Queries are the
+leading 64 key rows, attending over the full context
+prefix; attention-output MSE is reported but is
+V-dominated (values are identical in all arms), so the
+discriminating metric is attended-position top-1.
+
+| profile | ctx | arm | ratio | K SQNR | attended top-1 | vocab top-1 |
+|---|---|---|---|---|---|---|
+| llama-7b-like | 256 | E8 k2v2 | 6.74× | 10.38 dB | 0.926 | 0.556 |
+| | | scalar k2v2 | 6.74× | 10.24 dB | 0.946 | 0.550 |
+| | | scalar k3v2 | 5.57× | 15.85 dB | 0.967 | 0.551 |
+| llama-7b-like | 1024 | E8 k2v2 | 6.74× | 10.38 dB | 0.856 | 0.688 |
+| | | scalar k2v2 | 6.74× | 10.24 dB | 0.893 | 0.686 |
+| | | scalar k3v2 | 5.57× | 15.83 dB | 0.940 | 0.681 |
+| small-model-like | 512 | E8 k2v2 | 6.40× | 10.78 dB | 0.772 | 0.635 |
+| | | scalar k2v2 | 6.40× | 10.11 dB | 0.790 | 0.631 |
+| | | scalar k3v2 | 5.33× | 15.79 dB | 0.875 | 0.628 |
+| small-model-like | 2048 | E8 k2v2 | 6.40× | 10.79 dB | 0.730 | 0.637 |
+| | | scalar k2v2 | 6.40× | 10.09 dB | 0.738 | 0.644 |
+| | | scalar k3v2 | 5.33× | 15.77 dB | 0.817 | 0.639 |
+
+Attention-output error (max abs / MSE) per setting:
+llama ctx 256: E8 2.76e-02 / 2.68e-05, k2 2.70e-02 /
+2.68e-05, k3 2.70e-02 / 2.66e-05; ctx 1024: E8 1.22e-02 /
+6.82e-06, k2 1.20e-02 / 6.82e-06, k3 1.22e-02 / 6.78e-06.
+Small ctx 512: E8 1.43e-02 / 1.21e-05, k2 1.47e-02 /
+1.21e-05, k3 1.39e-02 / 1.20e-05; ctx 2048: E8 9.10e-03 /
+2.91e-06, k2 9.81e-03 / 2.92e-06, k3 9.63e-03 / 2.89e-06.
+Table-scored attention equivalent in all four settings
+(max abs diff 7.45e-09, 3.73e-09, 3.73e-09, 1.86e-09).
+
+**Honest reading — the done condition is NOT met.** E8 k2v2
+beats scalar k3v2 on attended top-1 in **0/4** settings,
+and beats scalar k2v2 in **0/4** either. The compression
+half holds (6.74× / 6.40×, ~20% smaller than scalar k3v2)
+and the table trick holds (equivalent to ≤ 7.5e-09), but
+the fidelity half does not reproduce the paper's 80% win
+rate on this synthetic data — and the synthetic data was
+fixed (P8's profiles) before measuring, not tuned to force
+a win, so the miss is reported as measured. Two findings
+narrow down why:
+
+1. **SQNR is not attention fidelity here.** E8 beats scalar
+   k2 on K SQNR in all four settings (+0.14 dB llama,
+   +0.67 dB small) — the lattice does buy the same-rate
+   geometry win the theory predicts — yet loses to scalar
+   k2 on attended top-1 in all four. A diagnostic on the
+   small profile at ctx 512 shows the same split: E8's
+   score-error std (0.0261) is *lower* than scalar k2's
+   (0.0320) and scalar k3's is lowest (0.0152), so E8's
+   errors are smaller on average but flip the argmax more
+   often. The score error that matters for top-1 is not its
+   RMS but its tail on the top-2 keys, and the lattice's
+   error concentrates there.
+2. **The overload tail costs real flips.** On the small
+   profile at ctx 512, E8 flips the attended position on
+   233/1024 queries vs 215 for scalar k2 — and 40% of E8's
+   flips involve a true-top key that contains a fallback
+   block, against a 15% base rate (the share for scalar k2,
+   whose flips cannot be caused by a fallback). The
+   fallback blocks are ~1.3% of blocks but a
+   disproportionate share of the damage: a fallback block
+   keeps its direction but halves its magnitude, which
+   systematically shrinks its key's scores. Fixing the
+   overload tail (a larger codebook radius, or a norm code
+   with finer steps) is the concrete next lever — but the
+   diagnostic also bounds it: even with the fallback cost
+   removed, E8 would at best tie scalar k2, and scalar k3's
+   score-error std is ~40% lower than E8's, so the gap to
+   k3 is a bit-width gap, not a fallback gap. On real KV
+   with stronger cross-dimension correlation and outlier
+   channels — the structure the paper's keys have and this
+   synthetic data only mildly mimics — the lattice's
+   shaping gain may be larger; on this data it is not
+   enough for one whole bit.
+
+What the build proves is the primitive with its numbers
+attached: a 56,881-codeword E8 quantiser with fast lattice
+decoding (no brute-force search), the 2-bit norm-code scale
+scheme shared identically by all arms, scalar baselines
+that actually beat it, table-scored attention that matches
+the dequantised path to 1e-8, and a context-sensitive
+fidelity eval — not that k2v2 beats k3v2 on a real model.
+
+### Regressions (re-run after P9)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 29,514 tokens saved, faithfulness
+  0.486, 0 violations).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+- P20 verify-by-doing lift +0.333 (8/24 vs 0/24, --tasks 24).
+- P21 tobench grounded 12/12, sloppy 1/12.
+- P22 `hr durable demo` kill/resume STATUS SUCCESS, zero violations.
+- P23 `hr eval --gepa --nights 4` 1→4→7→10→12/12, 4 edits kept,
+  1 rejected.
+- P4 `hr eval --corecall` hybrid+corecall any-hit@5 0.625,
+  R@10 0.476 (vs P1 hybrid 0.589/0.393).
+- P5 `hr eval --lessons` none 1/12, retrieved k=1 12/12, full 12/12,
+  planted backfire guideline rejected.
+- P6 `hr eval --lora` retrieval 0.357, student alone 0.696,
+  student+verify gated 0.714 at 2.23 records/query, planted
+  conflict caught.
+- P7 `hr eval --gaac` 1.455× / 1.600× lossless, bit-exact,
+  attention bit-identical, on-the-fly 6.0× less peak memory.
+- P8 `hr eval --kvcache` 14.25× / 14.29×, attended-pos top-1
+  0.986/0.964, vocab top-1 0.800/0.734, restart continuation
+  identical, 20× target NOT met.
+
+## What P9 hooks into (P10+)
+
+- `KVSnapshotStore` can swap the E8 quantiser in as its
+  tensor codec behind the same snapshot files: an
+  `E8QuantisedKeys` / `ScalarQuantised` pair serialises to
+  the same per-session files P8 writes, and the per-profile
+  norm-code statistics are the versioning primitive for a
+  coder that changes.
+- `fidelity_eval` is the context-sensitive form of P8's
+  `reasoning_eval` (queries attend over the whole prefix,
+  not a 64-key truncation): any later KV plan (P15 int4)
+  should score against it, not the truncated form, or long
+  contexts will look identical to short ones.
+- The fallback diagnostic is the open lever: the overload
+  tail, not the lattice geometry, is where E8 loses most of
+  its flips to scalar k2 on this data.
 
 ## P18 — CWL structured context eviction
 
