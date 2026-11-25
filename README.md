@@ -116,6 +116,14 @@ query ──┬── BM25 (FTS5) ────────────┐
   text lives on the episode row (`compressed_text` /
   `compressed_tokens`); the record is never rewritten; every
   compression lands in the `compressions` audit table.
+- `hybrid_retriever/corecall.py` — P4: REALM-style co-recall
+  graph (`log_co_use` / expansion atoms / `compose_expansion` /
+  `retrieve_expanded` / `reconsolidate` / `co_recall_clusters`).
+  Credit-weighted co-recall log (`corecall` table) + promoted
+  `co-recall` edges + the `reconsolidations` audit table, all in
+  the same SQLite file. The graph is an expander on P1's hybrid
+  retriever via `retrieve(..., graph_expander=...)`, never a
+  replacement.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -304,7 +312,7 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 162 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 183 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
@@ -335,6 +343,16 @@ file (render / apply / remove, idempotent), the A/B gate (win,
 no-improvement rejection, regression rejection), the nightly loop
 (one kept edit per night) and the full 4-night demo (4 kept, 1
 rejected, final 12/12).
+P4 adds: credit-weighted co-recall logging (min-credit weight,
+uncredited pairs excluded, accumulation), selective expansion
+(threshold, kind filter, per-seed cap, bounded hops, live-only),
+temporal and typed atoms, composed expansion, the empty-graph
+identity (expanded == hybrid with no co-recall edges), the
+co-recalled record surfacing through the graph leg only,
+candidate-id restriction of the graph leg, clusters, the
+reconsolidation job (promote / prune / 2-hop closure / dry-run
+writes nothing / near-duplicate merge inside a cluster), and the
+full co-recall eval smoke test on the synthetic corpus.
 
 ## P3 — Lychee-style lazy segment consolidation
 
@@ -453,6 +471,154 @@ path is untouched — the regression check confirms it.
 - `eval.py` — `run_segment_eval` is the fixed target P4 must not
   regress: boundary F1 0.949, consolidation 40 ops, semantic
   any-hit@5 0.958 / 1.000 / 0.750.
+
+## P4 — REALM-style co-recall graph
+
+`corecall.py` implements REALM (arXiv:2609.16053) on top of the
+P1–P3 store: memory as a lifecycle, not a store — retrieval
+reorganises memory so related memories cluster together over time.
+Reproduce with `hr eval --corecall`; inspect a store with
+`hr graph --db memory.db`; run the nightly job with
+`hr reconsolidate --db memory.db [--dry-run]`.
+
+Substitutions, stated plainly: REALM learns a retriever and
+re-encodes memories jointly. There is no learned encoder and no
+LLM here — co-recall is deterministic counting (pairs of records
+credited for the same answer accumulate credit weight in the
+`corecall` table), and "re-encoding" is the nightly job promoting
+those pairs to graph edges and re-linking clusters. The ONNX
+MiniLM vectors from P1 are the only embeddings involved. There is
+no live traffic on this VM, so the eval's co-recall history is
+seeded synthetic traffic: the 48 keyword queries run 3 rounds
+(simulating repeated use over days) through the same
+`record_use` + `log_co_use` path a live deployment runs after
+each answer; the 56 held-out paraphrase + trap queries are never
+used for warm-up.
+
+**Phase 1 — heterogeneous graph.** Memory nodes + edges in the
+same SQLite file: the P1 `edges` table, the new `corecall(a, b,
+count, wsum)` log, and the `reconsolidations` audit table.
+`log_co_use` logs every pair of *credited* records for one
+answer with weight min(credit_a, credit_b) — retrieved-but-unused
+records contribute nothing, because mere co-occurrence in a top-k
+list is not co-recall.
+
+**Phase 2 — adaptive graph-search retrieval.** Graph-search atoms
+(neighbour expansion over promoted co-recall edges, temporal,
+typed) composed per query via `compose_expansion`, as an EXPANDER
+on top of P1's hybrid retriever — `retrieve(...,
+graph_expander=...)` — never a replacement. The default atom is
+selective neighbour expansion: promoted edges only, top 3
+neighbours per seed, 1 hop. The temporal atom returns records
+created near a seed; the typed atom returns same-type records
+ranked by P2 importance.
+
+**Phase 3 — nightly reconsolidation** (`reconsolidate`, audited
+in `reconsolidations`): merge near-duplicates inside co-recall
+clusters first (P2 judge-gated `propose_merge`), promote
+credit-weighted pairs meeting the gate to `co-recall` edges
+(both directions, weight = wsum), re-link clusters by decayed
+2-hop closure (weight 0.5 × the best 2-hop path), and prune
+stale / non-live co-recall edges. `--dry-run` reports without
+writing.
+
+### Why the gate is credit-weighted (measured, not assumed)
+
+P1's graph leg chained *all* same-person records and hurt
+retrieval (hybrid R@10 0.631 vs vector-only 0.840). Raw co-recall
+counts do not fix that: after 3 warm-up rounds every co-credited
+pair — gold or distractor — reaches count ≥ 3 (1,302 pairs; the
+gold-gold and other count distributions are the same). The credit
+weight separates them: wsum ≥ 1.5 keeps 118/146 gold pairs and
+4/1,156 other pairs. That threshold is the promotion gate; the
+retrieval-side floor on promoted edges is deliberately loose
+(0.5) because promotion already did the strict filtering.
+
+### Measured results — co-recall eval (synthetic, labelled)
+
+56 held-out paraphrase + trap queries, 48 keyword queries × 3
+warm-up rounds. Embedder: `onnx-all-MiniLM-L6-v2`. The warm-up
+logged 1,302 co-recall pairs (122 at wsum ≥ 1.5); reconsolidation
+promoted 122 pairs, added 15 closure edges, pruned 0, proposed 0
+merges (no co-recalled pair on this corpus is a near-duplicate at
+Jaccard ≥ 0.9), and found 45 clusters; co-recall edges 0 → 274
+(both directions).
+
+| mode | P@10 | R@10 | nDCG@10 | any-hit@5 | grounding@10 |
+|---|---|---|---|---|---|
+| hybrid (P1 baseline) | 0.118 | 0.393 | 0.297 | 0.589 | 0.768 |
+| vector (bare cosine) | 0.223 | 0.744 | 0.626 | 0.875 | 0.911 |
+| hybrid+corecall-naive | 0.129 | 0.429 | 0.314 | 0.607 | 0.804 |
+| hybrid+corecall-raw | 0.139 | 0.464 | 0.330 | 0.607 | 0.839 |
+| hybrid+corecall (full P4) | 0.143 | 0.476 | 0.346 | **0.625** | 0.839 |
+| vector+corecall | 0.221 | 0.738 | 0.570 | 0.893 | 0.946 |
+
+**Ablations (the done condition, read at fixed paper weights):**
+the full P4 beats the P1 hybrid baseline — any-hit@5 0.589 →
+0.625 (+3.6pp, 2 of 56 queries), R@10 0.393 → 0.476 (+8.3pp).
+Reconsolidation itself helps, but only just: raw-log expansion
+0.607 → promoted-edge expansion 0.625 (+1 query; R@10 0.464 →
+0.476), and the naive arm (no threshold, 50 neighbours/seed,
+2 hops) also lands at 0.607 but with worse R@10 (0.429) — the
+gate buys recall@10, not hit@5. The expansion even helps the
+strongest leg: vector+corecall 0.893 vs vector-only 0.875, and
+grounding@10 0.946 vs 0.911.
+
+**Honest reading — the win is real and small.** 0.625 still sits
+far below bare cosine (0.875): the fixed-weight hybrid dilutes
+the strong vector leg with the weak BM25 leg, and the graph leg
+cannot fix a weighting problem — the same P1/P2 lesson. The
+sensitivity probe confirms the attribution: at vector-heavy
+weights (0.25/0.60/0.15) hybrid+corecall reaches 0.750, but
+vector-heavy hybrid *without* any graph already scores 0.714
+(pre-reconsolidation) and 0.804 with the graph leg removed
+entirely, so that gain is the weights, not the graph. Raising
+the graph weight hurts (0.30 → 0.571, 0.50 → 0.500); 2 hops is
+identical to 1 hop; top-1/2 neighbours per seed score 0.643 vs
+0.625 at top-3 — one query of noise, so the default stays at 3.
+On LongMemEval-S there is no usage history, so the co-recall
+graph is empty and the numbers are identical to the P1 table by
+construction (an empty expander contributes nothing — pinned by
+`test_retrieve_expanded_empty_graph_is_hybrid`); the graph only
+helps where memories have actually been used together. And the
+merge arm of reconsolidation is untested by this corpus: 0
+near-duplicate pairs, so the merge path is covered by unit tests
+only, not by the eval.
+
+### Regressions (re-run after P4)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 29,514 tokens saved, faithfulness
+  0.486, 0 violations).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+- P20 verify-by-doing lift +0.333 (8/24 vs 0/24, --tasks 24).
+- P21 tobench grounded 12/12, sloppy 1/12.
+- P22 `hr durable demo` kill/resume STATUS SUCCESS, zero violations.
+- P23 `hr eval --gepa --nights 4` 1→4→7→10→12/12, 4 edits kept,
+  1 rejected.
+
+## What P4 hooks into (P5+)
+
+- `retrieve(..., graph_expander=...)` is the hook any later plan
+  can use for a different expansion policy without touching the
+  fusion code; `compose_expansion` is where per-query atom
+  selection (e.g. learning which atoms win per query kind from
+  the P3 planner's route log) plugs in.
+- `reconsolidate` is the nightly-job pattern P5's lessons miner
+  can reuse: the `reconsolidations` audit table is the log any
+  offline job writes to.
+- The `corecall` table is the usage signal P2's TRACE credit
+  currently lacks a pair-level form of: a record pair's wsum is
+  joint usefulness, where per-record credit is individual.
 
 ## P18 — CWL structured context eviction
 

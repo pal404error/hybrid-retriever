@@ -6,13 +6,16 @@ import argparse
 import json
 import os
 
+from .corecall import graph_stats, reconsolidate
 from .embeddings import get_embedder
 from .eval import (
     print_compression_report,
+    print_corecall_report,
     print_eviction_report,
     print_report,
     print_segment_report,
     run_compression_eval,
+    run_corecall_eval,
     run_eviction_eval,
     run_longmemeval,
     run_segment_eval,
@@ -156,6 +159,14 @@ def cmd_eval(args) -> None:
             ucb_c=args.ucb_c,
         )
         print_report(result)
+        return
+    if args.corecall:
+        result = run_corecall_eval(
+            os.path.join("eval_data", "synthetic_corpus.jsonl"),
+            os.path.join("eval_data", "synthetic_queries.json"),
+            embedder=embedder,
+        )
+        print_corecall_report(result)
         return
     reranker = None
     modes = ("bm25", "vector", "hybrid", "hybrid+mmr")
@@ -401,6 +412,64 @@ def cmd_merges(args) -> None:
     store.close()
 
 
+def cmd_reconsolidate(args) -> None:
+    """P4: nightly reconsolidation — promote / re-link / prune / merge."""
+    embedder = get_embedder()
+    store = Store(args.db, embedder=embedder)
+    summary = reconsolidate(
+        store,
+        embedder=embedder,
+        min_wsum=args.min_wsum,
+        min_count=args.min_count,
+        closure_decay=args.closure_decay,
+        dry_run=args.dry_run,
+    )
+    print(
+        "reconsolidate%s: promoted=%d closure=%d pruned=%d clusters=%d "
+        "merges proposed=%d committed=%d%s rejected=%d "
+        "co-recall edges: %d -> %d (live records: %d)"
+        % (
+            " (dry run)" if args.dry_run else "",
+            summary["promoted"],
+            summary["closure_added"],
+            summary["pruned"],
+            summary["clusters"],
+            summary["merges_proposed"],
+            summary["merges_committed"],
+            (
+                " would-commit=%d" % summary["merges_would_commit"]
+                if args.dry_run
+                else ""
+            ),
+            summary["merges_rejected"],
+            summary["edges_before"],
+            summary["edges_after"],
+            store.count_live(),
+        )
+    )
+    store.close()
+
+
+def cmd_graph(args) -> None:
+    """P4: snapshot of the co-recall graph in a store."""
+    store = Store(args.db)
+    stats = graph_stats(store)
+    print(
+        "graph: live=%d corecall pairs=%d (>=1.5: %d) edges=%d %s "
+        "clusters=%d reconsolidations=%d"
+        % (
+            stats["live_records"],
+            stats["corecall_pairs"],
+            stats["corecall_pairs_ge_1.5"],
+            stats["edges_total"],
+            stats["edges_by_kind"],
+            stats["clusters"],
+            stats["reconsolidations"],
+        )
+    )
+    store.close()
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="hr", description="SQLite hybrid retriever")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -498,6 +567,13 @@ def main() -> None:
         "--traces", default=None,
         help="trace-store SQLite path for --gepa "
         "(default: temp-dir demo store)",
+    )
+    pe.add_argument(
+        "--corecall",
+        action="store_true",
+        help="P4 co-recall graph eval: hybrid / vector / naive / raw / "
+        "reconsolidated expansion on the synthetic corpus (warm-up on "
+        "keyword queries, eval on paraphrase+trap)",
     )
     pe.add_argument(
         "--k", type=int, default=5,
@@ -620,6 +696,25 @@ def main() -> None:
         help="arguments forwarded to hybrid_retriever.durable",
     )
     pd.set_defaults(func=cmd_durable)
+
+    pr = sub.add_parser(
+        "reconsolidate",
+        help="P4: nightly reconsolidation — promote co-recall pairs "
+        "to edges, re-link clusters, prune stale edges, merge "
+        "near-duplicates",
+    )
+    pr.add_argument("--db", required=True)
+    pr.add_argument("--dry-run", action="store_true")
+    pr.add_argument("--min-wsum", type=float, default=1.5)
+    pr.add_argument("--min-count", type=int, default=2)
+    pr.add_argument("--closure-decay", type=float, default=0.5)
+    pr.set_defaults(func=cmd_reconsolidate)
+
+    pg = sub.add_parser(
+        "graph", help="P4: snapshot of the co-recall graph in a store"
+    )
+    pg.add_argument("--db", required=True)
+    pg.set_defaults(func=cmd_graph)
 
     args = p.parse_args()
     args.func(args)

@@ -109,6 +109,7 @@ def retrieve(
     rerank_n: int = 20,
     candidate_ids: list[int] | None = None,
     importance_weight: float = 0.0,
+    graph_expander=None,
 ) -> list[Retrieved]:
     """Run the three legs, fuse with weighted RRF, optionally rerank + MMR.
 
@@ -119,7 +120,12 @@ def retrieve(
     (min-max over the fused set, so uniform importance changes
     nothing). w = 0 is exactly P1 behaviour. The boost is applied
     before rerank/MMR so they see the boosted order.
-    Returns at most ``k`` records, best first.
+    ``graph_expander`` is the P4 hook: when given, a callable
+    ``(seed_ids, leg_k) -> [(record_id, weight)]`` that replaces
+    the P1 neighbour leg (``store.neighbours``) with a selective
+    expansion — e.g. credit-weighted co-recall edges only. When
+    None, behaviour is exactly P1. Returns at most ``k`` records,
+    best first.
     """
     bm25_ids = [rid for rid, _ in store.bm25_search(query, leg_k, candidate_ids)]
     vec_ids: list[int] = []
@@ -136,7 +142,10 @@ def retrieve(
         else:
             query_vec = None
     seed_ids = bm25_ids[:10] + vec_ids[:10]
-    graph_ids = [rid for rid, _ in store.neighbours(seed_ids, leg_k)]
+    if graph_expander is not None:
+        graph_ids = [rid for rid, _ in graph_expander(seed_ids, leg_k)]
+    else:
+        graph_ids = [rid for rid, _ in store.neighbours(seed_ids, leg_k)]
 
     fused = rrf_fuse([bm25_ids, vec_ids, graph_ids], weights, k_rrf)
     if importance_weight > 0 and fused:

@@ -26,6 +26,13 @@ import math
 import os
 import tempfile
 
+from .corecall import (
+    DEFAULT_MIN_WSUM,
+    graph_stats,
+    log_co_use,
+    reconsolidate,
+    retrieve_expanded,
+)
 from .embeddings import get_embedder
 from .lifecycle import record_use
 from .retrieval import retrieve
@@ -287,6 +294,196 @@ def print_report(result: dict) -> None:
             "%-22s %6.3f %6.3f %8.3f %10.3f %12.3f"
             % (mode, m["P@10"], m["R@10"], m["nDCG@10"], m["any-hit@5"], m["grounding@10"])
         )
+
+
+# ----------------------------------------------------------------------
+# P4 co-recall graph eval
+# ----------------------------------------------------------------------
+def run_corecall_eval(
+    corpus_path: str,
+    queries_path: str,
+    embedder=None,
+    warmup_rounds: int = 3,
+    verbose: bool = True,
+) -> dict:
+    """P4 eval: does the co-recall graph beat the P1 hybrid baseline?
+
+    Warm-up on the 48 keyword queries, ``warmup_rounds`` rounds
+    (simulated repeated use — the same retrieval + credit + co-use
+    logging a live deployment runs after each answer), then eval on
+    the 56 held-out paraphrase + trap queries. The held-out queries
+    are never used for warm-up.
+
+    Arms, in scoring order (reconsolidation runs between the raw
+    arms and the promoted arms, so the raw arms are a true
+    pre-reconsolidation baseline):
+    - hybrid: P1 baseline (legacy 'related' graph leg).
+    - vector: bare cosine reference.
+    - hybrid+corecall-naive: expansion over the raw log, no
+      threshold, up to 50 neighbours/seed, 2 hops — the P1 mistake
+      repeated with co-recall edges.
+    - hybrid+corecall-raw: expansion over the raw log, gated at
+      wsum >= 1.0, top 3/seed, 1 hop — what the log alone gives,
+      before the nightly job.
+    - hybrid+corecall: after ``reconsolidate`` — expansion over
+      promoted edges (gate wsum >= 1.5 + pruning + cluster
+      closure + merges). The full P4.
+    - vector+corecall: vector base + the same promoted expansion.
+    Headline metric: any-hit@5 (evidence recall@5), as in P2.
+    """
+    embedder = embedder or get_embedder()
+    records, queries = load_synthetic(corpus_path, queries_path)
+    tmp = tempfile.mkdtemp(prefix="hr-eval-")
+    store = Store(os.path.join(tmp, "eval.db"), embedder=embedder)
+    texts = [r["text"] for r in records]
+    rids = store.add_texts(texts, type_="fact", embedder=embedder)
+    rid_of_key = {r["key"]: rid for r, rid in zip(records, rids)}
+    by_group: dict[str, list[int]] = {}
+    for r, rid in zip(records, rids):
+        by_group.setdefault(r.get("group", ""), []).append(rid)
+    edges = []
+    for group_rids in by_group.values():
+        for a, b in zip(group_rids, group_rids[1:]):
+            edges.append((a, b, 1.0, "related"))
+            edges.append((b, a, 1.0, "related"))
+    store.add_edges(edges)
+    warmup = [q for q in queries if q["kind"] == "keyword"]
+    heldout = [q for q in queries if q["kind"] != "keyword"]
+    if verbose:
+        print(
+            "indexed %d synthetic records (vec_mode=%s); warm-up on %d "
+            "keyword queries x %d rounds, eval on %d paraphrase+trap queries"
+            % (
+                store.count(),
+                store.vec_mode,
+                len(warmup),
+                warmup_rounds,
+                len(heldout),
+            )
+        )
+
+    def score(questions, mode_fn):
+        metrics = ["P@10", "R@10", "nDCG@10", "any-hit@5", "grounding@10"]
+        per = []
+        for q in questions:
+            gold = {rid_of_key[k] for k in q["gold_keys"] if k in rid_of_key}
+            ranked = mode_fn(q["question"])
+            per.append(score_modes({"m": ranked}, gold)["m"])
+        return {m: sum(p[m] for p in per) / len(per) for m in metrics}
+
+    def _hybrid(q):
+        return [r.id for r in retrieve(store, embedder, q, k=10, use_mmr=False)]
+
+    def _vector(q):
+        return [
+            r.id
+            for r in retrieve(
+                store, embedder, q, k=10, weights=(0.0, 1.0, 0.0),
+                use_mmr=False,
+            )
+        ]
+
+    for rnd in range(warmup_rounds):
+        for q in warmup:
+            gold = {rid_of_key[k] for k in q["gold_keys"] if k in rid_of_key}
+            res = retrieve(store, embedder, q["question"], k=10, use_mmr=False)
+            answer = "\n".join(
+                store.get_record(g)["text"] for g in sorted(gold)
+            )
+            credits = record_use(store, res, answer)
+            log_co_use(store, res, credits)
+        if verbose:
+            print("warm-up round %d/%d done" % (rnd + 1, warmup_rounds))
+    stats_before = graph_stats(store)
+
+    scores = {
+        "hybrid": score(heldout, _hybrid),
+        "vector": score(heldout, _vector),
+        "hybrid+corecall-naive": score(
+            heldout,
+            lambda q: [
+                r.id
+                for r in retrieve_expanded(
+                    store, embedder, q, k=10, source="log",
+                    min_wsum=0.0, max_per_seed=50, max_hops=2,
+                )
+            ],
+        ),
+        "hybrid+corecall-raw": score(
+            heldout,
+            lambda q: [
+                r.id
+                for r in retrieve_expanded(
+                    store, embedder, q, k=10, source="log",
+                    min_wsum=1.0, max_per_seed=3, max_hops=1,
+                )
+            ],
+        ),
+    }
+    recon = reconsolidate(store, embedder=embedder)
+    stats_after = graph_stats(store)
+    if verbose:
+        print("reconsolidation: %s" % (recon,))
+    scores["hybrid+corecall"] = score(
+        heldout,
+        lambda q: [
+            r.id
+            for r in retrieve_expanded(store, embedder, q, k=10)
+        ],
+    )
+    scores["vector+corecall"] = score(
+        heldout,
+        lambda q: [
+            r.id
+            for r in retrieve_expanded(
+                store, embedder, q, k=10, weights=(0.0, 1.0, 0.15)
+            )
+        ],
+    )
+    store.close()
+    return {
+        "corpus": "synthetic (labelled) — co-recall split",
+        "n_questions": len(heldout),
+        "n_warmup": len(warmup),
+        "warmup_rounds": warmup_rounds,
+        "n_records": len(records),
+        "embedder": embedder.name,
+        "scores": scores,
+        "reconsolidation": recon,
+        "graph_before": stats_before,
+        "graph_after": stats_after,
+    }
+
+
+def print_corecall_report(result: dict) -> None:
+    print_report(result)
+    recon = result["reconsolidation"]
+    before, after = result["graph_before"], result["graph_after"]
+    print(
+        "co-recall log: %d pairs (%d at wsum >= %.1f); "
+        "clusters: %d -> %d; co-recall edges: %d -> %d"
+        % (
+            before["corecall_pairs"],
+            before["corecall_pairs_ge_1.5"],
+            DEFAULT_MIN_WSUM,
+            before["clusters"],
+            after["clusters"],
+            before["edges_by_kind"].get("co-recall", 0),
+            after["edges_by_kind"].get("co-recall", 0),
+        )
+    )
+    print(
+        "reconsolidation: promoted=%d closure=%d pruned=%d "
+        "merges proposed=%d committed=%d rejected=%d"
+        % (
+            recon["promoted"],
+            recon["closure_added"],
+            recon["pruned"],
+            recon["merges_proposed"],
+            recon["merges_committed"],
+            recon["merges_rejected"],
+        )
+    )
 
 
 def run_longmemeval(

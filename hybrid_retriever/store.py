@@ -38,6 +38,21 @@ co_recall(a, b, count)
   How often two records were used together for one answer
   (a < b). The sleep job promotes count >= 2 pairs to 'co-recall'
   edges; the online path only ever writes this table, never edges.
+
+P4 (REALM-style co-recall graph) adds, all in the same SQLite file:
+corecall(a, b, count, wsum)
+  Credit-weighted co-recall log (a < b): ``count`` is how many
+  answers credited both records, ``wsum`` is the sum over those
+  answers of min(credit_a, credit_b). Raw counts do not separate
+  gold pairs from same-person distractors (probe: both reach
+  count 15 over 3 warm-up rounds); the credit weight does
+  (wsum >= 1.5 keeps 118/146 gold pairs, 4/1156 others).
+  Promotion to 'co-recall' edges reads this table, never the raw
+  co_recall counts.
+reconsolidations(id, kind, detail, created_at)
+  Audit table for the nightly reconsolidation job (P4 phase 3):
+  one row per run, detail as JSON (promoted / pruned / closure /
+  merges / clusters).
 """
 
 from __future__ import annotations
@@ -174,6 +189,24 @@ class Store:
                  b INTEGER NOT NULL,
                  count INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (a, b))"""
+        )
+        # P4 (REALM-style co-recall graph): credit-weighted co-recall
+        # log. Created here so existing files gain it on open, exactly
+        # like every other table in this schema.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS corecall(
+                 a INTEGER NOT NULL,
+                 b INTEGER NOT NULL,
+                 count INTEGER NOT NULL DEFAULT 0,
+                 wsum REAL NOT NULL DEFAULT 0.0,
+                 PRIMARY KEY (a, b))"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS reconsolidations(
+                 id INTEGER PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 detail TEXT NOT NULL DEFAULT '{}',
+                 created_at REAL NOT NULL)"""
         )
         c.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS records_fts "
@@ -415,6 +448,96 @@ class Store:
                 "ORDER BY count DESC",
                 (min_count,),
             ).fetchall()
+        ]
+
+    # -- P4: credit-weighted co-recall log + reconsolidation audit ----
+    def log_corecall(self, a: int, b: int, weight: float) -> None:
+        """Log one co-credited use of the pair (a, b).
+
+        ``weight`` is min(credit_a, credit_b) for that answer: a pair
+        only accumulates weight when *both* records actually earned
+        credit for the same answer, which is what separates jointly
+        useful memories from records that merely co-occurred in a
+        top-k list. Self-pairs and non-positive weights are ignored.
+        """
+        if a == b or weight <= 0:
+            return
+        lo, hi = (a, b) if a < b else (b, a)
+        self.conn.execute(
+            "INSERT INTO corecall(a, b, count, wsum) VALUES (?, ?, 1, ?) "
+            "ON CONFLICT(a, b) DO UPDATE SET count = count + 1, "
+            "wsum = wsum + excluded.wsum",
+            (lo, hi, float(weight)),
+        )
+        self.conn.commit()
+
+    def corecall_pairs(
+        self, min_count: int = 1, min_wsum: float = 0.0
+    ) -> list[tuple[int, int, int, float]]:
+        """[(a, b, count, wsum)] with count >= min_count and
+        wsum >= min_wsum, best weight first."""
+        return [
+            (int(a), int(b), int(n), float(w))
+            for a, b, n, w in self.conn.execute(
+                "SELECT a, b, count, wsum FROM corecall "
+                "WHERE count >= ? AND wsum >= ? ORDER BY wsum DESC",
+                (min_count, min_wsum),
+            ).fetchall()
+        ]
+
+    def corecall_weight(self, a: int, b: int) -> float:
+        """Accumulated credit weight for one pair (0.0 if never logged)."""
+        if a == b:
+            return 0.0
+        lo, hi = (a, b) if a < b else (b, a)
+        row = self.conn.execute(
+            "SELECT wsum FROM corecall WHERE a = ? AND b = ?", (lo, hi)
+        ).fetchone()
+        return float(row[0]) if row is not None else 0.0
+
+    def list_edges(
+        self, kind: str | None = None
+    ) -> list[tuple[int, int, float, str]]:
+        sql = "SELECT src, dst, weight, kind FROM edges"
+        params: list = []
+        if kind is not None:
+            sql += " WHERE kind = ?"
+            params.append(kind)
+        sql += " ORDER BY weight DESC"
+        return [
+            (int(s), int(d), float(w), k)
+            for s, d, w, k in self.conn.execute(sql, params).fetchall()
+        ]
+
+    def delete_edge(self, src: int, dst: int, kind: str) -> None:
+        self.conn.execute(
+            "DELETE FROM edges WHERE src = ? AND dst = ? AND kind = ?",
+            (src, dst, kind),
+        )
+        self.conn.commit()
+
+    def add_reconsolidation(self, kind: str, detail: dict) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO reconsolidations(kind, detail, created_at) "
+            "VALUES (?, ?, ?)",
+            (kind, json.dumps(detail), time.time()),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def list_reconsolidations(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id, kind, detail, created_at FROM reconsolidations "
+            "ORDER BY id"
+        ).fetchall()
+        return [
+            {
+                "id": int(r[0]),
+                "kind": r[1],
+                "detail": json.loads(r[2]),
+                "created_at": r[3],
+            }
+            for r in rows
         ]
 
     def list_live_records(
