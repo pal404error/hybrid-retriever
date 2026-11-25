@@ -218,6 +218,12 @@ def cmd_eval(args) -> None:
         result = run_offload_eval()
         print_offload_report(result)
         return
+    if args.int4:
+        from .int4 import print_int4_report, run_int4_eval
+
+        result = run_int4_eval()
+        print_int4_report(result)
+        return
     if args.lora:
         from .lora import (
             print_lora_report,
@@ -833,6 +839,16 @@ def main() -> None:
         "hard RAM cap, with prefetch + LRU cache and a "
         "benchmark table (layers x RAM cap x disk -> tok/s) "
         "measured on /tmp (tmpfs) vs the home disk",
+    )
+    pe.add_argument(
+        "--int4",
+        action="store_true",
+        help="P15 int4 KV quantisation + correctness harness "
+        "— angular vs plain per-group int4 keys on synthetic "
+        "KV (P8 profiles + a 16K-token long context), top-1 "
+        "agreement vs FP16, the attention scale-factor sweep, "
+        "and the compressed-domain attention path (no MLX, no "
+        "Mac, no real model, no 70B/128K run)",
     )
     pe.add_argument(
         "--corecall",
