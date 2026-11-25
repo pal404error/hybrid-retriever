@@ -170,6 +170,12 @@ def cmd_eval(args) -> None:
         result = run_gaac_eval()
         print_gaac_report(result)
         return
+    if args.kvcache:
+        from .kvcache import print_kvcache_report, run_kvcache_eval
+
+        result = run_kvcache_eval()
+        print_kvcache_report(result)
+        return
     if args.lora:
         from .lora import (
             print_lora_report,
@@ -714,6 +720,15 @@ def main() -> None:
         "round-trip, bit-identical attention, and the on-the-fly "
         "attention analogue on synthetic BF16 KV (no real checkpoints, "
         "no Triton/Metal kernel)",
+    )
+    pe.add_argument(
+        "--kvcache",
+        action="store_true",
+        help="P8 KV-cache snapshot store: transform coding (PCA + "
+        "adaptive quantisation + Huffman) ratio vs accuracy on "
+        "synthetic correlated BF16-baseline KV, plus the "
+        "multi-turn restart demo (no real model, no real "
+        "checkpoints)",
     )
     pe.add_argument(
         "--corecall",

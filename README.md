@@ -51,6 +51,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # P7 GAAC lossless KV codec (synthetic BF16 KV, no real checkpoints):
 .venv/bin/python -m hybrid_retriever.cli eval --gaac
+
+# P8 KV-cache snapshot store with transform coding (synthetic KV):
+.venv/bin/python -m hybrid_retriever.cli eval --kvcache
 ```
 
 ## Architecture
@@ -154,6 +157,15 @@ query ──┬── BM25 (FTS5) ────────────┐
   `run_gaac_eval`). NumPy only, deterministic, no torch, no
   model — synthetic BF16 KV only, stated in the module
   docstring and the P7 section below.
+- `hybrid_retriever/kvcache.py` — P8: KV-cache snapshot store
+  with transform coding (`generate_synthetic_kv` /
+  `fit_coder` / `quantise` / `dequantise` / `huffman_encode` /
+  `huffman_encode_columns` / `TransformCodedTensor` /
+  `Snapshot` / `KVSnapshotStore` / `reasoning_eval` /
+  `run_session_demo` / `run_kvcache_eval`). NumPy only,
+  deterministic, no torch, no model — synthetic correlated
+  BF16-baseline KV only, stated in the module docstring and
+  the P8 section below.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -342,7 +354,7 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 226 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 246 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
@@ -400,6 +412,24 @@ plus its memory saving, row-decode correctness, and edge cases
 (constant exponents → width 0, single channel, channels not
 divisible by the group size, wide exponent range → width 8,
 empty / single-element tensors, bad magic rejected).
+P8 adds: PCA round-trip and the correlation control
+(correlated KV needs < d/2 components at 98% variance,
+isotropic noise needs > 0.9d), quantiser error bounds
+(in-range error ≤ step/2, out-of-range clipping, zero
+quantises to exactly zero), bit allocation (monotone in
+component variance, inside [2, 8]), Huffman round-trips
+(skewed / uniform / two-symbol / all-256 / single-symbol /
+empty, determinism, Kraft sum ≤ 1, per-column codebooks
+beating one shared alphabet, degenerate columns), tensor
+serialisation round-trips (ratio and bits/code preserved,
+bad magic rejected), the constant-tensor and empty-tensor
+edge cases, the measured ratio + accuracy per profile, the
+snapshot save/load round-trip (latest turn, missing session
+raises), the per-profile basis cache (fresh store reloads
+the same coder from disk; snapshots still load if the cache
+is deleted), and the restart demo (bounded error pinned;
+argmax identity reported as measured, with the gap/error
+diagnostic that explains a flip).
 
 ## P3 — Lychee-style lazy segment consolidation
 
@@ -1119,6 +1149,210 @@ pinned by tests, not that 1.4× reproduces on a real model.
   would need on the host side: tile the decode the way
   `attention_onthefly` does, and the kernel replaces the
   NumPy tile loop, not the format.
+
+## P8 — KV-cache snapshot store with transform coding
+
+`kvcache.py` implements KV Cache Transform Coding
+(arXiv:2511.01815) on top of P7's synthetic KV profiles:
+resume a long agent session without re-prefilling —
+transform-code the KV cache to disk after each turn (PCA
+decorrelation + adaptive quantisation + entropy coding),
+reload it next turn. Reproduce with `hr eval --kvcache`.
+
+Substitutions, stated plainly: this VM has no torch, no GPU,
+and no real model checkpoints, so **no real model ran and
+none is pretended**. The pipeline runs on SYNTHETIC
+BF16-baseline KV tensors with realistic structure: P7's two
+profiles (same shapes and seeds) extended with
+CROSS-CHANNEL CORRELATION that PCA can actually exploit —
+each tensor is a low-rank latent signal (rank 16 for the
+128-dim profile, rank 8 for the 64-dim one; latent scales
+decaying linearly 1.0 → 0.35) plus small independent noise
+(std 0.05) plus per-channel scale variation (N(1, 0.25)
+clipped to [0.5, 1.8]). That correlation is the legitimate
+structure transform coding exploits in real caches; the
+parameters were fixed before the final ratio was measured
+and were not tuned to hit a number. The ratios below are
+synthetic-KV ratios vs a BF16 baseline (2 bytes/element),
+not real-checkpoint ratios. There is no LLM and no real
+reasoning benchmark: the "reasoning task" is a deterministic
+NumPy attention check in P7's style — attention-output
+error and top-1 agreement vs the uncompressed baseline on a
+fixed set of queries over the KV. And there is no real agent
+process: the Phase 3 "restart" is a fresh
+`KVSnapshotStore` object (empty in-memory basis cache)
+reloading the snapshot file from disk, not a separate OS
+process.
+
+**Pipeline.** Per tensor, K and V separately, each with its
+own PCA basis fitted on a brief calibration slice (the first
+128 tokens, all heads):
+
+1. **PCA decorrelation** — SVD on the centred calibration
+   slice (float64), keeping the smallest k whose cumulative
+   explained variance reaches 0.98. The basis is cached per
+   profile ("model") on disk under the store root
+   (`bases/<profile>.npz`), so a resumed session reloads it
+   instead of refitting. The control that the coder exploits
+   the planted correlation: correlated KV needs k=43/44 of
+   128 components (profile A) and k=22/23 of 64 (profile B),
+   while isotropic noise of the same shape needs > 0.9d.
+2. **Adaptive per-component quantisation** — each retained
+   component gets its own bit width from its calibration
+   standard deviation (`bits = clip(round(3 + log2(σ_c /
+   median σ)), 2, 8)`), range ±4σ, so early components get
+   up to 8 bits and tail components 2. The quantiser has an
+   ODD level count (`2**bits - 1`), so the middle level
+   represents exactly zero — an even level count would have
+   put a zero coefficient half a step off (caught by the
+   constant-tensor test, fixed in the quantiser, not the
+   test). Per-coefficient error is bounded by half the step,
+   pinned by test for in-range coefficients; out-of-range
+   values clip to the end levels.
+3. **Entropy coding** — a deterministic canonical Huffman
+   coder in pure Python (stdlib + NumPy, no third-party
+   entropy library), with ONE codebook PER PCA component. A
+   shared alphabet was tried first and measured: it costs
+   ~1.3 bits/code on these profiles (unified entropy 4.42
+   vs mean per-component entropy 3.13), because early
+   components spread over 256 values while tail components
+   use only 4. Per-component codebooks recover it, at
+   k × 256 code-length bytes of header. Degenerate columns
+   (one distinct symbol) store an all-zero length row, write
+   no bits, and record the symbol separately.
+
+**Format.** `TransformCodedTensor` (`KVTC`): magic, version,
+shape, d, k, code count, bitstream length, then mean
+(float32), basis (float32, d × k), per-component scales and
+bit widths, per-component Huffman lengths (k × 256 bytes)
+plus degenerate-column symbols, then the bitstream. A
+snapshot file (`KVSN`) is a JSON header (profile, session,
+turn, token count) plus the K and V `KVTC` blobs,
+length-prefixed. Every snapshot carries its own coder, so it
+loads even if the basis cache is deleted (pinned by test).
+
+**Phase 3 demo.** A 4-turn coding session on the
+llama-7b-like profile: 192 tokens, +64 per turn, snapshot
+after each turn; after turn 2 the "process restarts" (fresh
+store object, empty basis cache) and turns 3–4 continue from
+the reconstructed snapshot prefix plus the same new tokens
+from the seeded generation — never re-prefilled.
+
+### Measured results — ratio vs accuracy (synthetic KV)
+
+Reproduce with `hr eval --kvcache`. Attention checks run on
+the leading 64 tokens (all heads); the vocab task projects
+attention outputs through a fixed seeded random matrix
+(128 vocab entries) and argmaxes.
+
+| profile | shape | K ratio | V ratio | combined | k (K/V) | mean bits |
+|---|---|---|---|---|---|---|
+| llama-7b-like | 1024×32×128 | 14.41× | 14.10× | **14.25×** | 43/44 | 4.21 |
+| small-model-like | 2048×16×64 | 14.47× | 14.11× | **14.29×** | 22/23 | 4.18 |
+
+| profile | attention max abs | MSE | attended-position top-1 | vocab top-1 |
+|---|---|---|---|---|
+| llama-7b-like | 2.80e-02 | 2.57e-05 | **0.986** | 0.800 |
+| small-model-like | 2.34e-02 | 2.67e-05 | **0.964** | 0.734 |
+
+Huffman runs at 3.11 / 3.09 bits/code (K/V profile A),
+3.09 / 3.03 (profile B). Serialised round-trip max abs
+element error 0.313 / 0.258 (A) and 0.315 / 0.244 (B) on
+values with per-element std ~1.
+
+| demo turn | tokens | snapshot bytes | continuation (uninterrupted) | continuation (restarted) |
+|---|---|---|---|---|
+| 1 | 192 | 276,944 | 1 | — |
+| 2 | 256 | 346,137 | 80 | — (restart here) |
+| 3 | 320 | 415,365 | 65 | **65** |
+| 4 | 384 | 484,681 | 86 | **86** |
+
+Restart after turn 2: continuation identical on both
+restarted turns, max attention-output error after restart
+7.87e-03, turn-2 snapshot ratio 12.12× (shorter prefix, so
+the basis/header overhead weighs more than at full length),
+basis cached on disk.
+
+**Honest reading — the ~20× half of the done condition is
+NOT met.** Both profiles land at ~14.3×, not 20×, and the
+number is reported as measured, not tuned into existence:
+the operating point (98% variance, bit centre 3) was frozen
+from the accuracy/ratio tradeoff before the final eval. The
+aggressive operating point (95% variance, bit centre 4)
+reaches ~46× on the same synthetic data in prototype, but
+drops attended-position top-1 agreement to 0.84 on the small
+profile — ratio bought by truncating signal the attention
+actually uses. The accuracy half holds in the sense the plan
+means it: attended-position top-1 0.96–0.99 and attention
+MSE ~2.6e-05. The vocab top-1 (0.73–0.80) is the harsher
+readout: a random (untrained) vocab projection has
+near-zero top-1 margins, so it is the metric most sensitive
+to any lossy step, and it is reported alongside rather than
+in place of the retrieval metric. The restart half holds on
+this run (identical continuation on both restarted turns),
+but with a caveat the demo records rather than hides: the
+uninterrupted run's top-2 logit gaps on the restarted turns
+were 2.6e-04 and 7.8e-04 while the codec's max logit
+perturbation was 1.1e-03 and 8.6e-04 — identity held even
+though the gap did not exceed the perturbation, because the
+max over all 128 logits overstates the perturbation of the
+top two. A lossy codec guarantees bounded error, not argmax
+identity; on a run where the top-1 margin is smaller than
+the top-1/top-2 perturbation, the continuation will flip,
+and the demo's per-turn gap/error diagnostics are what
+would show it. The lossless P7 codec is the one that
+guarantees identity. What the build proves is the machinery
+(PCA basis fitted on a brief calibration slice and cached
+per profile, adaptive per-component quantisation with a
+pinned error bound, per-component Huffman entropy coding,
+per-session snapshot files, reload-and-continue with no
+re-prefill) with the measured numbers attached, not that
+20× reproduces on a real model.
+
+### Regressions (re-run after P8)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 29,514 tokens saved, faithfulness
+  0.486, 0 violations).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+- P20 verify-by-doing lift +0.333 (8/24 vs 0/24, --tasks 24).
+- P21 tobench grounded 12/12, sloppy 1/12.
+- P22 `hr durable demo` kill/resume STATUS SUCCESS, zero violations.
+- P23 `hr eval --gepa --nights 4` 1→4→7→10→12/12, 4 edits kept,
+  1 rejected.
+- P4 `hr eval --corecall` hybrid+corecall any-hit@5 0.625,
+  R@10 0.476 (vs P1 hybrid 0.589/0.393).
+- P5 `hr eval --lessons` none 1/12, retrieved k=1 12/12, full 12/12,
+  planted backfire guideline rejected.
+- P6 `hr eval --lora` retrieval 0.357, student alone 0.696,
+  student+verify gated 0.714 at 2.23 records/query, planted
+  conflict caught.
+- P7 `hr eval --gaac` 1.455× / 1.600× lossless, bit-exact,
+  attention bit-identical, on-the-fly 6.0× less peak memory.
+
+## What P8 hooks into (P9+)
+
+- `KVSnapshotStore` is the resume primitive any later KV plan
+  can reuse: P9's lattice quantiser or P15's int4 KV can swap
+  in as the tensor codec behind the same snapshot files, and
+  the per-profile basis cache is the versioning primitive for
+  a coder that changes (a new calibration invalidates the
+  cached basis, exactly like P6's fact-set hash invalidates a
+  student).
+- The `reasoning_eval` task (attention error + attended-
+  position top-1 + vocab top-1) is the fixed accuracy harness
+  a lossier codec has to beat: a codec that cannot hold
+  attended-position top-1 ≥ 0.95 at its claimed ratio has not
+  earned the ratio, whatever its bits/code says.
 
 ## P18 — CWL structured context eviction
 
