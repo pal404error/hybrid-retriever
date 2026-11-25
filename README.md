@@ -48,6 +48,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # P19 type-aware tool-output compression (inside the eviction loop):
 .venv/bin/python -m hybrid_retriever.cli evict --db memory.db --session s1 --budget 2000 --compress
 .venv/bin/python -m hybrid_retriever.cli eval --compression   # compress+evict vs evict-only A/B
+
+# P7 GAAC lossless KV codec (synthetic BF16 KV, no real checkpoints):
+.venv/bin/python -m hybrid_retriever.cli eval --gaac
 ```
 
 ## Architecture
@@ -145,6 +148,12 @@ query ──┬── BM25 (FTS5) ────────────┐
   per project, with verify-then-regenerate against the text
   store (vector-leg audit, gated or always) and a planted-
   conflict demo proving a stale weight gets caught.
+- `hybrid_retriever/gaac.py` — P7: GAAC lossless KV codec
+  (`generate_synthetic_kv` / `compress` / `decompress` /
+  `decode_rows` / `attention` / `attention_onthefly` /
+  `run_gaac_eval`). NumPy only, deterministic, no torch, no
+  model — synthetic BF16 KV only, stated in the module
+  docstring and the P7 section below.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -333,7 +342,7 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 213 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 226 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
@@ -383,6 +392,14 @@ fact-set hash change, context-free answering (0 records read),
 the vector-leg audit, and the planted-conflict catch (superseded
 old fact, regenerated from the corrected records) plus the
 three-arm eval's read-cost ordering.
+P7 adds: the codec round-trip (bit-exact on both synthetic
+profiles, K and V, in memory and through the serialised blob),
+the measured ratio per profile, bit-identical attention from
+original vs decompressed KV, on-the-fly attention equivalence
+plus its memory saving, row-decode correctness, and edge cases
+(constant exponents → width 0, single channel, channels not
+divisible by the group size, wide exponent range → width 8,
+empty / single-element tensors, bad magic rejected).
 
 ## P3 — Lychee-style lazy segment consolidation
 
@@ -964,6 +981,144 @@ always-audit catch, and `gated_would_audit == False`.
 - `answer_student`'s verify step is the P20 habit at answer
   granularity: check the claimed fact against retrieved records
   (recomputation, not trust), and regenerate only on conflict.
+
+## P7 — GAAC lossless KV codec (offline prototype)
+
+`gaac.py` implements GAAC (arXiv:2610.38210) on top of nothing
+but NumPy: lossless compression of BF16 KV-cache exponents —
+per-channel base-plus-offset codes with group-adaptive widths —
+mantissas stored verbatim, so decompression is bit-for-bit and
+the codec composes with every lossy technique. Reproduce with
+`hr eval --gaac`.
+
+Substitutions, stated plainly: this VM has no torch, no GPU,
+and no real model checkpoints, and Triton/Metal are
+unavailable, so **no real checkpoint was compressed and no
+fused kernel was built, and none is pretended**. The codec runs
+on SYNTHETIC BF16 KV-cache tensors with realistic exponent
+structure: two fixed profiles (seeded RNG), each a (K, V) pair
+of shape (seq, heads, d_head) — `llama-7b-like`
+(1024×32×128, base exponent ~ N(127, 3), deltas 0–6 with a
+0.70/0.20/0.07/0.03 dominant-plus-tail split) and
+`small-model-like` (2048×16×64, base ~ N(124, 2), deltas 0–2
+at 0.90/0.08/0.02). The profile parameters were fixed BEFORE
+any ratio was measured and were not tuned to hit a number; the
+ratios below are synthetic-KV ratios, not real-checkpoint
+ratios, and the plan's 1.4× bar is judged on them as stated.
+
+**Codec.** One design decision is documented because a naive
+reading of the paper gets it wrong: the base is PER CHANNEL
+(one byte per channel) and the width is GROUP-ADAPTIVE (one
+width per group of 16 channels, the narrowest width covering
+every offset in the group). A shared base per group would be
+blown up by the inter-channel magnitude spread — real KV
+channels differ by several exponent steps from each other —
+so a group base would force a wide offset range and kill the
+ratio. The per-channel base costs one byte per channel and
+keeps the width driven only by the within-channel spread,
+which is what actually clusters. Offsets are `exp -
+base[channel]`, packed MSB-first at the group's width;
+sign (1 bit) + mantissa (7 bits) are stored verbatim as one
+byte per element. The serialised blob is magic `GAAC`,
+version, group size, shape, per-channel bases, per-group
+widths, verbatim bytes, then each group's packed offsets
+byte-aligned (at most one byte per group wasted) so rows can
+be decoded by random access.
+
+**Phase 2 (CPU analogue, not the kernel).**
+`attention_onthefly` decodes K/V exponents in 128-token
+tiles during the NumPy attention loop without ever
+materialising the full decompressed cache, via `decode_rows`.
+The real Triton/Metal fused kernel is NOT built.
+
+### Measured results — synthetic BF16 KV
+
+Reproduce with `hr eval --gaac`. Attention checks run on the
+leading 256 tokens (all heads).
+
+| profile | shape | K ratio | V ratio | combined | group widths |
+|---|---|---|---|---|---|
+| llama-7b-like | 1024×32×128 | 1.455× | 1.455× | **1.455×** | all 3-bit |
+| small-model-like | 2048×16×64 | 1.600× | 1.600× | **1.600×** | all 2-bit |
+
+- Round-trip: decompressed bytes == original bytes, exact,
+  on both profiles, K and V, in memory and through the
+  serialised blob.
+- Attention: outputs from original vs decompressed KV are
+  bit-identical on both profiles (the codec is lossless, so
+  this is the check the plan asks for, run explicitly rather
+  than assumed).
+- On-the-fly attention: equivalent to the full-decompress path
+  on both profiles (max abs diff 7.63e-06 / 1.91e-06) — but
+  NOT bit-identical, and the reason is honest float32
+  arithmetic, not a codec error: the weighted sum is
+  accumulated block by block, so summation order differs from
+  a single BLAS `probs @ V`. The bit-identical guarantee
+  belongs to the codec; the tiled path is equivalent to
+  rounding.
+- Tradeoff (256-token slice): on-the-fly peak extra memory
+  2048 KB vs 12288 KB full path (6.0× less) on profile A,
+  512 KB vs 3072 KB (6.0× less) on profile B — one float32
+  tile vs the decompressed BF16 caches plus their float32
+  copies. Wall time is a wash on A (~0.5s vs ~0.4s across
+  runs) and faster on B (~0.1s vs ~0.3s); the saving is
+  memory, not speed, and the per-block row decode is the
+  cost centre.
+
+**Honest reading — the done condition is met on synthetic KV
+(1.455× and 1.600×, both ≥ 1.4×), but the number that would
+settle the plan is a real checkpoint, which this VM cannot
+produce.** The synthetic profiles have exactly the structure
+GAAC exploits (tight per-channel clusters), so the ratio is
+an upper-ish bound for how the codec behaves on friendly
+data; a real cache with wider per-channel tails or outlier
+channels would widen some groups and lower the ratio, and
+the width histogram per group is the diagnostic that would
+show it. What the build proves is the machinery (per-channel
+base + group-adaptive width + bit packing + random-access
+row decode + tiled on-the-fly attention) with bit-exactness
+pinned by tests, not that 1.4× reproduces on a real model.
+
+### Regressions (re-run after P7)
+
+- TRACE split: identical to P2 (vector 0.875, hybrid 0.589,
+  hybrid+trace w=0.5 0.571 at ucb_c=1.0).
+- Segment eval: identical to P3 — boundaries semantic F1 0.949,
+  fixed-window 0.292; consolidation 40 semantic ops; semantic
+  any-hit@5 0.958 / 1.000 / 0.750.
+- Eviction eval (P18 fixed target): CWL task hit@5 1.000,
+  user-turn recall 1.000, 40/40 user turns, 0 dependency
+  violations, at budget 1076 — identical.
+- Compression eval: identical to P19 (hit@5 0.350, survival
+  mean-over-time 0.681/0.682, 29,514 tokens saved, faithfulness
+  0.486, 0 violations).
+- LongMemEval-S 50Q: identical to P1/P2/P3 (bm25 R@10 1.000,
+  vector 0.860, hybrid 0.980, hybrid+mmr 0.860).
+- P20 verify-by-doing lift +0.333 (8/24 vs 0/24, --tasks 24).
+- P21 tobench grounded 12/12, sloppy 1/12.
+- P22 `hr durable demo` kill/resume STATUS SUCCESS, zero violations.
+- P23 `hr eval --gepa --nights 4` 1→4→7→10→12/12, 4 edits kept,
+  1 rejected.
+- P4 `hr eval --corecall` hybrid+corecall any-hit@5 0.625,
+  R@10 0.476 (vs P1 hybrid 0.589/0.393).
+- P5 `hr eval --lessons` none 1/12, retrieved k=1 12/12, full 12/12,
+  planted backfire guideline rejected.
+- P6 `hr eval --lora` retrieval 0.357, student alone 0.696,
+  student+verify gated 0.714 at 2.23 records/query, planted
+  conflict caught.
+
+## What P7 hooks into (P8+)
+
+- `compress` / `decompress` are the offline-codec primitive
+  any later KV plan can reuse: P8's snapshot store can swap
+  its transform coder for this lossless codec where bit-exact
+  resume matters, and the per-group width histogram is the
+  diagnostic that tells whether a real cache is GAAC-friendly
+  before any kernel work starts.
+- `decode_rows` is the random-access primitive a fused kernel
+  would need on the host side: tile the decode the way
+  `attention_onthefly` does, and the kernel replaces the
+  NumPy tile loop, not the format.
 
 ## P18 — CWL structured context eviction
 

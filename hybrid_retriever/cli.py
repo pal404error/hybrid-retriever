@@ -164,6 +164,12 @@ def cmd_eval(args) -> None:
             write_guidelines(args.lessons_out, result["guidelines"])
             print("guidelines written to %s" % args.lessons_out)
         return
+    if args.gaac:
+        from .gaac import print_gaac_report, run_gaac_eval
+
+        result = run_gaac_eval()
+        print_gaac_report(result)
+        return
     if args.lora:
         from .lora import (
             print_lora_report,
@@ -700,6 +706,14 @@ def main() -> None:
     pe.add_argument(
         "--lora-rank", type=int, default=32,
         help="adapter rank for --lora (default 32)",
+    )
+    pe.add_argument(
+        "--gaac",
+        action="store_true",
+        help="P7 GAAC lossless KV codec: compression ratio, bit-exact "
+        "round-trip, bit-identical attention, and the on-the-fly "
+        "attention analogue on synthetic BF16 KV (no real checkpoints, "
+        "no Triton/Metal kernel)",
     )
     pe.add_argument(
         "--corecall",
