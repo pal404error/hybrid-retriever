@@ -78,6 +78,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # P16 context-engineering lab (Beyond Token Savings replication, deterministic — no SWE-bench, no real agent, no LLM):
 .venv/bin/python -m hybrid_retriever.cli eval --context-lab
+
+# P17 SUMONE-style learned summariser, distilled (deterministic — no LLM, no Qwen, no GRPO, no torch):
+.venv/bin/python -m hybrid_retriever.cli eval --sumone
 ```
 
 ## Architecture
@@ -268,6 +271,24 @@ query ──┬── BM25 (FTS5) ────────────┐
   measuring success, tokens, wall-clock latency and
   MODELLED cost per policy, stated in the module docstring
   and the P16 section below.
+- `hybrid_retriever/sumone.py` — P17: SUMONE-style learned
+  summariser, distilled (`SummariserConfig` /
+  `summarise_trajectory` / `summarise_text` /
+  `SummarisingContext` / `parameter_search` /
+  `run_sumone_eval`). NumPy + stdlib only, deterministic,
+  no LLM, no Qwen model, no GRPO training, no torch — an
+  extractive summariser with a masked-reconstruction
+  self-check, tuned by a reward-driven parameter search
+  (the Phase 2 analogue, NOT fine-tuning), evaluated
+  full-trajectory vs summarised on the fixed P21 (12) +
+  P20 (24) task sets with the same checkpoint on both
+  harnesses, stated in the module docstring and the P17
+  section below. Reuses P16's context-bound agent (plus
+  two additive hooks: `run_task_with_policy` accepts
+  `return_ctx` and a `context_cls` factory), P3's
+  segment framing (one segment per episode, minimum
+  sentences per segment), and P19's extractive-only
+  discipline.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -3309,6 +3330,211 @@ fired, so there was little left to lose.
   top-1 invariant to c while vocab top-1 falls 0.945→0.891
   as c 0.25→8, compressed-domain attention equivalent but
   7–30× slower, done NOT met.
+
+## P17 — SUMONE-style learned summariser (distilled version)
+
+`sumone.py` implements SUMONE (arXiv:2611.06445) as a small
+standalone summariser that plugs into any agent: in the
+paper, a 0.5–2B model (Qwen) is fine-tuned with GRPO where
+the reward is masked reconstruction — a frozen reconstructor
+must recover masked spans of the original trajectory from
+the summary, plus a length penalty — learned self-supervised
+from raw trajectories only, no reference summaries.
+Reproduce with `hr eval --sumone`.
+
+**Substitutions, stated plainly:** no LLM, no Qwen model, no
+GRPO training and no torch ran on this VM, and none was
+downloaded or installed. The deterministic stand-ins are:
+(1) Phase 1 (prompt-based compact-or with a reconstruction
+self-check) is an EXTRACTIVE summariser — sentence selection
+over trajectory turns, scored by tunable weights (goal-word
+overlap, numbers, quoted values, tool-result vs reasoning
+type, first-in-segment position), reusing P3's segment
+framing (each episode is a segment; a minimum number of
+sentences is kept per segment) and P19's extractive-only
+discipline (every summary sentence is verbatim from the
+original; `verify_extractive` proves it). The reconstruction
+self-check is the quality gate in both variants, exactly as
+in the paper: mask spans of the original trajectory, attempt
+to recover each masked span from the summary alone with
+deterministic retrieval (BM25-style word-overlap over the
+summary sentences — the P6-style prototype-answering idea,
+no LLM), and REJECT the summary when its masked-span
+recovery rate falls below the fixed threshold 0.75. A
+rejected summary is re-summarised at a looser budget (×1.5,
+then ×2.0) and, if it still fails, returned UNCOMPRESSED
+with a flag — the gate protects correctness instead of
+silently degrading it. (2) Phase 2 (GRPO fine-tuning) is a
+REWARD-DRIVEN PARAMETER SEARCH: a fixed 48-config grid over
+the selection weights, compression budget and minimum
+sentences per segment, optimising EXACTLY the paper's reward
+— masked-span recovery rate minus 0.5 × the summary/original
+token ratio — on a training set of trajectories (18 agent
+trajectories from teacher runs on the train split plus 4
+trajectories from P3 segment data). The best config is kept
+as the "checkpoint" and evaluated held-out. That is
+parameter search, NOT GRPO — no weights were updated, no
+model was trained, and nothing here claims otherwise.
+(3) The agent benchmark is P16's context-bound deterministic
+agent (P21 grounded policy + P20 rule solver), run on the
+fixed P21 12-task + P20 24-task sets TWICE — once with full
+trajectories as context, once with summaries from the tuned
+summariser (tool-result episodes enter the context already
+summarised, via `SummarisingContext`). The two task sets are
+the two harnesses; the same checkpoint serves both.
+Inference cost is total context tokens fed to the agent
+(P16's `tokens_processed` accounting). Summariser input
+tokens are reported separately as overhead, NOT folded into
+agent cost — in the paper the summariser is a small cheap
+model and the agent is the expensive one, and the split is
+labelled wherever it appears.
+
+**Masking scheme (frozen before the search):** candidate
+spans are (a) numeric literals (record ids, totals, scores),
+(b) quoted fact values (`'...'` / `"..."`, with possessive
+apostrophes excluded), and (c) goal key tokens (content
+words, length ≥ 3, from the task goal that appear in the
+trajectory). From the candidates, a FIXED seeded sample of
+at most 8 spans per trajectory (6 per episode in the agent
+arm) is masked (`random.Random(7)` over a deterministically
+sorted candidate list) — a sample, not all spans, because
+masking every number would make the recovery rate equal the
+kept fraction by construction and the reward would then
+favour no compression at all. The sample is fixed before
+the search and identical for every config. `coverage`
+(fraction of ALL candidate spans present in the summary) is
+reported as a diagnostic, never as the gate.
+
+**Measured results — search:** best of 48 configs, mean
+reward 0.602 vs default 0.580 (improvement +0.023) over 22
+train trajectories (18 agent + 4 P3-segment). Checkpoint:
+`budget_frac 0.25, w_number 3.0, w_goal 0.5, w_tool 0.0,
+w_reason 0.0, w_first 0.5, min_per_segment 1`. Held-out (18
+trajectories): checkpoint 0.549 (recovery 0.910, token ratio
+0.722) vs default 0.513 (recovery 0.910, ratio 0.794),
+improvement +0.036 — the search generalises on the reward,
+but only by shrinking the token ratio at identical recovery.
+
+**Measured results — agent eval, same checkpoint on both
+harnesses:**
+
+| harness | full | summarised | lost | full tokens | sum tokens | reduction |
+|---|---|---|---|---|---|---|
+| P21 (12) | 12/12 | 4/12 | 8 | 4,722 | 4,118 | 12.8% |
+| P20 (24) | 8/24 | 8/24 | 0 | 25,568 | 17,088 | 33.2% |
+
+Summariser overhead (reported separately): P21 read 315
+tokens, 29 tool results summarised, 0 fell back
+uncompressed, mean episode recovery 0.957; P20 read 10,536
+tokens, 72 tool results summarised, 8 fell back
+uncompressed, mean episode recovery 0.875.
+
+**Done: NOT met.** The done condition (≥75% agent cost
+reduction with ≤1 task lost per set, on BOTH harnesses,
+same checkpoint) fails on both counts on P21: 12.8%
+reduction and 8 tasks lost. The table stands as measured;
+the grid, masking scheme, reward weights and threshold
+were NOT re-tuned after the held-out measurement.
+
+**Why it fails — diagnosed, not tuned away:** (1) the
+sampled-mask gate is too weak for exact-answer tasks. A
+summary can pass the gate (5 of 6 sampled masks recovered)
+while dropping the specific facts the verifier checks: all
+three compute tasks and all three deliver tasks fail, plus
+two of three summarize tasks, because the dropped lines
+carried totals and gold facts the sampled masks never
+covered. (2) The masking scheme systematically undervalues
+structural lines: the M2 CSV header (`id,item,amount`)
+carries no number, no quoted value and no goal key token
+(`id` is 2 letters), so it scores ~0 and is dropped — and
+without the header the parser treats the first data row as
+the header and the compute fails, even though the summary's
+sampled recovery was 1.00. A mask scheme that only sees
+"facts" cannot see load-bearing structure. (3) The cost
+math caps the win even where success holds: accepted
+episode summaries land at ~0.43–0.58 token ratio (retries
+push budgets up), and most billed tokens come from repeated
+scans of the untouched user / reasoning / tool-call
+episodes, so even halving every tool result only cuts 13%
+(P21) to 33% (P20) of agent tokens. P20 holds success
+because its agent only needs the rule line from visible
+recall — the solver re-parses the full artifact itself —
+while P21's compute and summarize tasks read their answers
+out of the summarised text. The honest summary: masked
+reconstruction on a 6-mask sample is a real gate, but on
+this harness it gates the wrong thing, and the −75% target
+needs the summariser to also shrink the reasoning/user
+episodes it currently leaves alone.
+
+### Regressions (re-run after P17)
+
+- TRACE recall@5 vector 0.875, hybrid 0.589, +trace w=0.5 0.571.
+- Segments semantic F1 0.949, fixed-window 0.292, 40 ops,
+  any-hit@5 0.958/1.000/0.750.
+- Eviction CWL hit@5 1.000, user-turn recall 1.000 (40/40),
+  0 violations, budget 1076.
+- Compression hit@5 0.350, survival mean-over-time 0.681/0.682,
+  29,514 tokens saved, faithfulness 0.486, 0 violations.
+- LongMemEval-S 50Q bm25 R@10 1.000, vector 0.860, hybrid 0.980,
+  hybrid+mmr 0.860.
+- P20 verify-by-doing lift +0.333 (8/24 vs 0/24, --tasks 24).
+- P21 tobench grounded 12/12, sloppy 1/12.
+- P22 `hr durable demo` kill/resume STATUS SUCCESS, zero violations.
+- P23 `hr eval --gepa --nights 4` 1→4→7→10→12/12, 4 edits kept,
+  1 rejected.
+- P4 `hr eval --corecall` hybrid+corecall any-hit@5 0.625,
+  R@10 0.476.
+- P5 `hr eval --lessons` none 1/12, retrieved k=1 12/12,
+  full 12/12, backfire rejected.
+- P6 `hr eval --lora` retrieval 0.357, student alone 0.696,
+  student+verify gated 0.714 at 2.23 records/query, planted
+  conflict caught.
+- P7 `hr eval --gaac` 1.455× / 1.600× lossless, bit-exact,
+  attention bit-identical.
+- P8 `hr eval --kvcache` 14.25× / 14.29×, attended-pos top-1
+  0.986/0.964, vocab top-1 0.800/0.734, restart continuation
+  identical, 20× NOT met.
+- P9 `hr eval --e8` E8 k2v2 beats scalar k3v2 in 0/4 settings
+  and scalar k2v2 in 0/4, table trick max abs diff ≤7.5e-09,
+  done NOT met.
+- P10 `hr eval --spec` fixed 2563.6 tok/s (baseline 2580.0),
+  adaptive 2465.8 tok/s (baseline 2527.6) — the deterministic
+  columns are identical to baseline (2.84 tok/fwd, 0.996
+  agree; 2.87 tok/fwd, 0.997 agree), and the done flag reads
+  False this run (adaptive loses wall-clock −3.8%; baseline
+  −2.0%), done NOT met.
+- P11 `hr eval --spec-scratch` χ² 45.71, df 63, p=0.9504 PASS,
+  wall-clock K=6 config A 1.62×, B 2.05× (baseline 1.69×,
+  1.99× — wall-clock varies), done MET.
+- P12 `hr eval --retrieval-drafter` small-target retrieval
+  7015.5 tok/s vs model-based 3958.4 (1.77×; baseline 4782.4
+  vs 3008.2, 1.59× — wall-clock varies), acceptance 0.677 vs
+  0.587, overhead 3.12µs vs 9.23µs (baseline 3.69µs vs
+  12.31µs — wall-clock varies), done MET.
+- P13 `hr eval --disco` 39.77× bandwidth saving (16,107 vs
+  640,563 bytes), slow link 317.4 vs 14.7 tok/s (21.64×;
+  baseline 296.0 vs 14.6, 20.23× — wall-clock varies),
+  fast link 1.09× (baseline 1.00×), output identity proved,
+  done MET.
+- P14 `hr eval --offload` model-bigger-than-cap runs
+  correctly, outputs match all-in-RAM exactly, cap 66,048 B
+  respected, Q4 6.14×, prefetch loses 0.95× (baseline 0.85×
+  — wall-clock varies), offload ~130× slower than all-in-RAM
+  (47.1 vs 6121.8 tok/s; baseline ~167×), done MET for the
+  mechanism.
+- P15 `hr eval --int4` ratio 3.16×/3.12×, attended top-1
+  0.979–0.987 llama / 0.955–0.965 small / 0.920–0.945 long,
+  vocab top-1 0.856–0.918, scale-factor sweep shows attended
+  top-1 invariant to c while vocab top-1 falls 0.945→0.891
+  as c 0.25→8, compressed-domain attention equivalent but
+  7–30× slower, done NOT met.
+- P16 `hr eval --context-lab` baseline 20/36, 30,290 tokens;
+  trc-50/25 20/36 at 0.666× tokens/cost; truncate 0.600×;
+  summarise 1.530× tokens and 15.704× cost; done NOT met
+  (no clear win on latency — inside the no-op noise band:
+  this re-run's raw flag read 4 wins, but the no-op control
+  itself ran 0.850× baseline latency, so those wins are
+  noise and the verdict stands).
 
 ## P18 — CWL structured context eviction
 

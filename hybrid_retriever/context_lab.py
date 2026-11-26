@@ -851,11 +851,18 @@ def _run_vbd_task(
 def run_task_with_policy(
     task: dict, policy: PolicyConfig, vbd_store=None, embedder=None,
     run_dir: str | None = None,
+    return_ctx: bool = False,
+    context_cls=None,
 ) -> dict:
     """One task under one policy. Returns the per-task metrics;
     latency is the wall-clock of the agent run only (store setup
-    is harness overhead, identical for every policy)."""
-    ctx = Context()
+    is harness overhead, identical for every policy).
+    ``return_ctx`` also returns the live ``Context`` (the
+    trajectory) for capture by P17. ``context_cls`` is a
+    zero-argument Context factory (default ``Context``) — P17
+    passes a ``SummarisingContext`` factory so tool results
+    enter the context already summarised."""
+    ctx = (context_cls or Context)()
     if task.get("kind") in ("summarize", "correct", "compute", "deliver"):
         # _seed_env builds a fresh tiny store per task run, so the
         # agent's remember/complete calls are isolated per policy.
@@ -875,7 +882,7 @@ def run_task_with_policy(
         )
         maybe_compact(ctx, policy, end_of_task=True)
         latency = time.perf_counter() - start
-    return {
+    result = {
         "task_id": task.get("task_id") or task.get("id"),
         "kind": task["kind"],
         "passed": passed,
@@ -890,6 +897,9 @@ def run_task_with_policy(
         "final_live_tokens": ctx.live_tokens(),
         "trigger_checks": ctx.trigger_checks,
     }
+    if return_ctx:
+        return result, ctx
+    return result
 
 
 # ----------------------------------------------------------------------

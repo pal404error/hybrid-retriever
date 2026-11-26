@@ -233,6 +233,12 @@ def cmd_eval(args) -> None:
         result = run_context_lab_eval()
         print_context_lab_report(result)
         return
+    if args.sumone:
+        from .sumone import print_sumone_report, run_sumone_eval
+
+        result = run_sumone_eval()
+        print_sumone_report(result)
+        return
     if args.lora:
         from .lora import (
             print_lora_report,
@@ -877,6 +883,17 @@ def main() -> None:
         "context-bound deterministic agent; success, tokens, "
         "latency and MODELLED cost per policy (no SWE-bench, no "
         "Terminal-Bench, no real coding agent, no LLM)",
+    )
+    pe.add_argument(
+        "--sumone",
+        action="store_true",
+        help="P17 SUMONE-style learned summariser (distilled) — "
+        "deterministic extractive summariser with a masked-"
+        "reconstruction self-check, tuned by a reward-driven "
+        "parameter search (NOT GRPO, no LLM, no Qwen, no "
+        "torch), evaluated full-trajectory vs summarised on "
+        "the fixed P21 (12) + P20 (24) task sets with the same "
+        "checkpoint on both harnesses",
     )
     pe.add_argument(
         "--k", type=int, default=5,
