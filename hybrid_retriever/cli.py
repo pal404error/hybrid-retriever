@@ -224,6 +224,15 @@ def cmd_eval(args) -> None:
         result = run_int4_eval()
         print_int4_report(result)
         return
+    if args.context_lab:
+        from .context_lab import (
+            print_context_lab_report,
+            run_context_lab_eval,
+        )
+
+        result = run_context_lab_eval()
+        print_context_lab_report(result)
+        return
     if args.lora:
         from .lora import (
             print_lora_report,
@@ -856,6 +865,18 @@ def main() -> None:
         help="P4 co-recall graph eval: hybrid / vector / naive / raw / "
         "reconsolidated expansion on the synthetic corpus (warm-up on "
         "keyword queries, eval on paraphrase+trap)",
+    )
+    pe.add_argument(
+        "--context-lab",
+        action="store_true",
+        help="P16 context-engineering lab (Beyond Token Savings "
+        "replication) — the primitive x trigger x depth policy "
+        "grid (baseline, no-op control, TRC / truncate / "
+        "summarise at depths 0.50 and 0.25, TRC every 2 turns) "
+        "run on the fixed P21 (12) + P20 (24) task sets with a "
+        "context-bound deterministic agent; success, tokens, "
+        "latency and MODELLED cost per policy (no SWE-bench, no "
+        "Terminal-Bench, no real coding agent, no LLM)",
     )
     pe.add_argument(
         "--k", type=int, default=5,

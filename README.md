@@ -75,6 +75,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # P15 int4 KV quantisation + correctness harness (synthetic KV, NumPy, no MLX/Mac/real model):
 .venv/bin/python -m hybrid_retriever.cli eval --int4
+
+# P16 context-engineering lab (Beyond Token Savings replication, deterministic — no SWE-bench, no real agent, no LLM):
+.venv/bin/python -m hybrid_retriever.cli eval --context-lab
 ```
 
 ## Architecture
@@ -253,6 +256,18 @@ query ──┬── BM25 (FTS5) ────────────┐
   the attention scale-factor sweep and the compressed-domain
   attention path, stated in the module docstring and the
   P15 section below.
+- `hybrid_retriever/context_lab.py` — P16: context-
+  engineering lab (`PolicyConfig` / `POLICY_GRID` / `Context`
+  / `scan` / `apply_truncate` / `apply_trc` /
+  `apply_summarise` / `maybe_compact` / `run_task_with_policy`
+  / `run_context_lab_eval`). NumPy + stdlib only,
+  deterministic, no LLM, no torch, no SWE-bench, no
+  Terminal-Bench, no real coding agent — a context-bound
+  deterministic agent runs the fixed P21 (12) + P20 (24)
+  task sets under a primitive × trigger × depth policy grid,
+  measuring success, tokens, wall-clock latency and
+  MODELLED cost per policy, stated in the module docstring
+  and the P16 section below.
 
 ## P2 — MEMOIR-style lifecycle (TRACE-UCB + judge-gated merge + sleep)
 
@@ -441,7 +456,7 @@ faster machine is available.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 374 tests, all passing
+.venv/bin/python -m pytest tests/ -q   # 396 tests, all passing
 ```
 
 Covers: store (both vector backends), FTS5 + candidate filtering,
@@ -627,6 +642,25 @@ rejection), and eval determinism (all non-timing columns
 identical across two full eval runs) with the done
 condition pinned as measured (False — identical top-1
 is not met on this synthetic data).
+P16 adds: policy config parsing/validation (unknown
+primitive / trigger / depth / budget / every_n rejected,
+unknown dict keys rejected, the no-op control's shape
+legal), each primitive on a fixed context (TRC clears
+tool results only and keeps the record, truncate drops
+oldest-first with user-turn + active-window protection
+and reports unreachable targets, summarise compresses
+long episodes, never rewrites user turns, stays
+extractive, and charges tokens + a call), trigger firing
+rules (budget only above budget, every-N once per turn
+count, end-of-task only at the end, never / none never
+compacts), the cost model rates, the context-bound read
+path (a cleared tool result is forgotten before
+consumption, an evicted reasoning episode takes its
+answer with it), scan determinism and billing, and the
+harness end-to-end on a tiny subset (baseline 3/4, the
+no-op control identical to baseline on every
+deterministic metric, TRC holding success while cutting
+tokens) plus per-task determinism across two runs.
 
 ## P3 — Lychee-style lazy segment consolidation
 
@@ -3089,6 +3123,192 @@ baseline, and every done / NOT-met verdict above is
 unchanged from baseline except none: P10 reads False
 here, as in the baseline (the P14 run's True was the
 noise flip).
+
+## P16 — Context-engineering lab (Beyond Token Savings replication)
+
+`context_lab.py` implements Beyond Token Savings
+(arXiv:2609.32961) as a configurable compaction module plus the
+evaluation that proves whether compression helps: any policy
+decomposes into primitive (truncate / clear tool results /
+summarise) × trigger (when) × depth (how much), and each policy
+is measured on success, tokens, latency and cost. Reproduce
+with `hr eval --context-lab`.
+
+**Substitutions, stated plainly:** no SWE-bench, no
+Terminal-Bench, no real coding agent and no LLM ran on this VM,
+and none was downloaded. The deterministic stand-ins are: (1)
+the "coding agent" is a context-bound deterministic policy
+running the repo's own fixed task sets — the P21 mini-TOBench
+12-task set plus the P20 verify-by-doing 24-task computed-answer
+set (36 tasks, fixed before measuring) — reusing the P21 tool
+servers and verifiers and the P20 rule solver and verifier
+unchanged; (2) the "context" is the agent's working context, a
+P18-style episode log (user turn, reasoning, tool calls, tool
+results) with deterministic token counts, and the agent is
+CONTEXT-BOUND — every step derives its inputs only from the
+live episodes it can still see, so evicting the wrong episode
+fails the task; (3) the primitives reuse repo machinery —
+TRUNCATE is oldest-first eviction with P18's protections (user
+turns and the active window never dropped), CLEAR-TOOL-RESULTS
+replaces a tool-result body with a placeholder keeping the
+record that a result existed, SUMMARISE applies the P19
+extractive compressor per episode (deterministic, no LLM); the
+agent's own reasoning episode is itself a P3-style
+consolidation, distilling the tool result into the essentials
+(the firing rule, the gold facts, the computed total) — which
+is why clearing a result the agent has already consumed can be
+safe; (4) a tool result is consumed by the immediately
+following reasoning turn BEFORE any compaction can fire —
+compaction fires only at turn boundaries, never on the raw
+result; (5) latency is measured wall-clock, but there is no LLM
+call for it to scale with, so each agent step does real
+token-proportional work — it re-scans the live context 32
+times (word-overlap search), standing in for the layered
+attention passes of a real forward pass; the pass count is
+fixed before measuring and identical for every policy; (6)
+cost is MODELLED, not a real bill: processed tokens at $3.00
+per million, plus $0.002 per summarise invocation (a
+summariser is an extra model call in the real world; TRC and
+truncate are free local ops), and summariser input tokens
+count as processed — compression is never free.
+
+**Phase 1 — policy grid** (frozen before the measurement run;
+the grid, the task set and the cost model were not re-tuned
+after measuring): no-compaction baseline; a no-op control (the
+compaction machinery runs with primitive `none`, and must
+reproduce the baseline exactly on every deterministic metric);
+TRC / truncate / summarise at depths 0.50 and 0.25 under a
+120-token budget trigger (chosen from the measured baseline
+peaks — VbD json 600 / log 641 / table 298, TOBench 76–156 —
+so it binds on the long-context tasks and not on the shortest
+ones); and TRC under an every-2-turns trigger. The end-of-task
+trigger is implemented and tested but is NOT in the grid: in
+single-task sessions it fires after the last scan, so it cannot
+change any of the four metrics.
+
+### Measured results — the 4-metric table (fixed 36-task set)
+
+Canonical run (run 3 of 4 post-refactor runs; every
+deterministic column was identical across all four runs and
+the earlier pre-refactor run). Embedder:
+`onnx-all-MiniLM-L6-v2`. Baseline success is 20/36 — 12/12
+TOBench plus 8/24 VbD (only the log tasks pass: on json/table
+the distractor rule wins the first-firing rule, exactly the
+P20 hybrid arm's 8/24).
+
+| policy | success | tokens | tok × | latency | lat × | cost $ (modelled) | cost × |
+|---|---|---|---|---|---|---|---|
+| baseline | 20/36 | 30,290 | 1.000 | 2.55 s | 1.000 | 0.0909 | 1.000 |
+| noop | 20/36 | 30,290 | 1.000 | 2.55 s | 1.001 | 0.0909 | 1.000 |
+| trc-50 | 20/36 | 20,182 | 0.666 | 2.63 s | 1.032 | 0.0605 | 0.666 |
+| trc-25 | 20/36 | 20,182 | 0.666 | 2.53 s | 0.996 | 0.0605 | 0.666 |
+| truncate-50 | 20/36 | 18,177 | 0.600 | 2.35 s | 0.925 | 0.0545 | 0.600 |
+| truncate-25 | 20/36 | 18,177 | 0.600 | 2.26 s | 0.890 | 0.0545 | 0.600 |
+| summarise-50 | 20/36 | 46,342 | 1.530 | 3.06 s | 1.203 | 1.4270 | 15.704 |
+| summarise-25 | 20/36 | 46,342 | 1.530 | 2.79 s | 1.097 | 1.4270 | 15.704 |
+| trc-every2 | 20/36 | 21,184 | 0.699 | 2.52 s | 0.991 | 0.0636 | 0.699 |
+
+Compactions (deterministic, identical every run): TRC 47,
+truncate 31, summarise 96 (644 summarise calls), trc-every2
+36, noop 0. Success deltas vs baseline: +0.0pp on every row.
+
+**Honest reading — done NOT met.** The paper's TRC direction
+reproduces on the deterministic metrics: TRC holds success
+while cutting tokens and modelled cost to 0.666×, truncate to
+0.600×. But the done condition needs a CLEAR win on all four,
+and latency has no clear winner: the no-op control — the same
+work as baseline — measures 0.93–1.19× across four runs, and
+every policy's latency range overlaps 1.0 and that noise band
+(trc-50 0.87–1.17, trc-25 0.77–1.07, truncate-50 0.87–1.05,
+truncate-25 0.89–1.12, summarise-50 0.74–1.21, summarise-25
+0.84–1.10, trc-every2 0.89–1.00). The mechanical per-run flag
+flips with the noise (1 winner, then 5, then 4, then 5 across
+the four runs), so no policy is a clear win on latency and
+the verdict is NOT met. The likely mechanism: fixed per-task
+costs (the verifier runs, the ONNX query embedding for VbD
+recall, the server calls) dominate the ~2.5 s totals, and the
+token-proportional scan is a minority share — at this scale,
+token savings do not reliably convert to wall-clock savings,
+which is the paper's lesson in miniature.
+
+Three more findings, all deterministic: (1) depth does not
+matter here — trc-50 == trc-25, truncate-50 == truncate-25
+and summarise-50 == summarise-25 on every metric, because
+compaction works in whole episodes and clearing or dropping
+one big tool result already overshoots either target; (2)
+summarise is the paper's "fewer tokens ≠ cheaper" in the
+extreme — it does not even reduce total tokens (1.530×),
+because the summariser must read everything it compresses
+(~16k extra processed tokens), and its 644 calls at $0.002
+each make modelled cost 15.70× baseline, all while holding
+success at 20/36; (3) the paper's −11pp summarisation loss
+did NOT reproduce — no policy loses any success here, because
+P19 compression is extractive-only and the agent's reasoning
+episode already distilled the essentials before compaction
+fired, so there was little left to lose.
+
+### Regressions (re-run after P16)
+
+- TRACE recall@5 vector 0.875, hybrid 0.589, +trace w=0.5 0.571.
+- Segments semantic F1 0.949, fixed-window 0.292, 40 ops,
+  any-hit@5 0.958/1.000/0.750.
+- Eviction CWL hit@5 1.000, user-turn recall 1.000 (40/40),
+  0 violations, budget 1076.
+- Compression hit@5 0.350, survival mean-over-time 0.681/0.682,
+  29,514 tokens saved, faithfulness 0.486, 0 violations.
+- LongMemEval-S 50Q bm25 R@10 1.000, vector 0.860, hybrid 0.980,
+  hybrid+mmr 0.860.
+- P20 verify-by-doing lift +0.333 (8/24 vs 0/24, --tasks 24).
+- P21 tobench grounded 12/12, sloppy 1/12.
+- P22 `hr durable demo` kill/resume STATUS SUCCESS, zero violations.
+- P23 `hr eval --gepa --nights 4` 1→4→7→10→12/12, 4 edits kept,
+  1 rejected.
+- P4 `hr eval --corecall` hybrid+corecall any-hit@5 0.625,
+  R@10 0.476.
+- P5 `hr eval --lessons` none 1/12, retrieved k=1 12/12,
+  full 12/12, backfire rejected.
+- P6 `hr eval --lora` retrieval 0.357, student alone 0.696,
+  student+verify gated 0.714 at 2.23 records/query, planted
+  conflict caught.
+- P7 `hr eval --gaac` 1.455× / 1.600× lossless, bit-exact,
+  attention bit-identical.
+- P8 `hr eval --kvcache` 14.25× / 14.29×, attended-pos top-1
+  0.986/0.964, vocab top-1 0.800/0.734, restart continuation
+  identical, 20× NOT met.
+- P9 `hr eval --e8` E8 k2v2 beats scalar k3v2 in 0/4 settings
+  and scalar k2v2 in 0/4, table trick max abs diff ≤7.5e-09,
+  done NOT met.
+- P10 `hr eval --spec` fixed 2485.4 tok/s, 2.84 tok/fwd,
+  0.996 agree; adaptive 2530.2 tok/s, 2.87 tok/fwd, 0.997
+  agree — the deterministic columns are identical to baseline,
+  and the done flag reads **True** this run (adaptive wins
+  wall-clock +1.8%), a shared-VM noise flip: baseline fixed
+  2580.0 vs adaptive 2527.6 tok/s (−2.0%), done NOT met.
+- P11 `hr eval --spec-scratch` χ² 45.71, df 63, p=0.9504 PASS,
+  wall-clock K=6 config A 1.75×, B 2.13× (baseline 1.69×,
+  1.99× — wall-clock varies), done MET.
+- P12 `hr eval --retrieval-drafter` small-target retrieval
+  7094.5 tok/s vs model-based 3995.0 (1.78×; baseline 4782.4
+  vs 3008.2, 1.59× — wall-clock varies), acceptance 0.677 vs
+  0.587, overhead 3.10µs vs 9.07µs (baseline 3.69µs vs
+  12.31µs — wall-clock varies), done MET.
+- P13 `hr eval --disco` 39.77× bandwidth saving (16,107 vs
+  640,563 bytes), slow link 319.8 vs 14.7 tok/s (21.81×;
+  baseline 296.0 vs 14.6, 20.23× — wall-clock varies),
+  fast link 1.10× (baseline 1.00×), output identity proved,
+  done MET.
+- P14 `hr eval --offload` model-bigger-than-cap runs
+  correctly, outputs match all-in-RAM exactly, cap 66,048 B
+  respected, Q4 6.14×, prefetch loses 0.76× (baseline 0.85×
+  — wall-clock varies), offload ~143× slower than all-in-RAM
+  (43.6 vs 6252.1 tok/s; baseline ~167×), done MET for the
+  mechanism.
+- P15 `hr eval --int4` ratio 3.16×/3.12×, attended top-1
+  0.979–0.987 llama / 0.955–0.965 small / 0.920–0.945 long,
+  vocab top-1 0.856–0.918, scale-factor sweep shows attended
+  top-1 invariant to c while vocab top-1 falls 0.945→0.891
+  as c 0.25→8, compressed-domain attention equivalent but
+  7–30× slower, done NOT met.
 
 ## P18 — CWL structured context eviction
 
